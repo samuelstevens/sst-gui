@@ -209,6 +209,18 @@ def main(spec: pathlib.Path, /):
     for frame in frames:
         frame_groups[frame.group].append(frame)
 
+    # Check all groups have at least 2 reference masks before starting any inference
+    groups_with_insufficient_refs = []
+    for group, group_frames in frame_groups.items():
+        ref_masks = get_ref_masks(spec, set(f.pk for f in group_frames))
+        if len(ref_masks) < 2:
+            groups_with_insufficient_refs.append((group, len(ref_masks)))
+
+    if groups_with_insufficient_refs:
+        for group, ref_count in groups_with_insufficient_refs:
+            logger.error("Group %s has %d reference mask(s).", group, ref_count)
+        return
+
     model = transformers.Sam2VideoModel.from_pretrained(spec.sam2).to(
         spec.device, dtype=torch.bfloat16
     )
