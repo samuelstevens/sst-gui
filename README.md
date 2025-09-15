@@ -22,3 +22,7 @@ Then filter the masks to the objects you care about and label the objects with i
 ![Filtered masks in an image](docs/assets/filtered-masks.png)
 
 Finally, save your masks to disk. Then run `uv run inference.py spec.json`.
+
+You can validate that your images work by using `uv run view.py PATH`:
+
+![View mask](docs/assets/example-mask.png)
