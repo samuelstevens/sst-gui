@@ -3,7 +3,6 @@ import collections.abc
 import dataclasses
 import logging
 import pathlib
-import typing as tp
 
 import beartype
 import duckdb
@@ -12,7 +11,6 @@ import polars as pl
 import torch
 import transformers
 import tyro
-from jaxtyping import UInt8, jaxtyped
 from PIL import Image
 
 import lib

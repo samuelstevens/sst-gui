@@ -21,21 +21,39 @@ import lib
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+@beartype.beartype
+class Frame:
+    def __init__(self, path: pathlib.Path, pk: str):
+        self.path = path
+        self.pk = pk
+        self._img = None
+
+    def __hash__(self) -> int:
+        return hash(str(self.path) + self.pk)
+
+    @property
+    def img(self):
+        if self._img is None:
+            with Image.open(self.path) as img:  # Load the image data and close the file
+                self._img = img.copy()
+        return self._img
+
+
 @st.cache_resource
 def load_pipeline(model: str):
     return transformers.pipeline("mask-generation", model=model, device=device)
 
 
-@st.cache_data(hash_funcs={lib.Frame: hash})
-def get_all_masks(model, frame: lib.Frame):
+@st.cache_data(hash_funcs={Frame: hash})
+def get_all_masks(model, frame: Frame):
     pipeline = load_pipeline(model)
     return pipeline(frame.img, points_per_batch=64)
 
 
-@st.cache_data(hash_funcs={lib.Frame: hash})
+@st.cache_data(hash_funcs={Frame: hash})
 @jaxtyped(typechecker=beartype.beartype)
 def show_frame(
-    frame: lib.Frame,
+    frame: Frame,
     *,
     scale: float = 0.2,
     masks: Bool[np.ndarray, "n_masks height width"] | None = None,
@@ -132,7 +150,7 @@ def show_frame(
 
 @jaxtyped(typechecker=beartype.beartype)
 def save_reference_mask(
-    frame: lib.Frame,
+    frame: Frame,
     masks: Bool[np.ndarray, "n_masks height width"],
     mask_labels: list[int],
     root: pathlib.Path,
@@ -248,7 +266,7 @@ def main():
     group = st.selectbox("Select image group:", group_keys)
 
     frames = [
-        lib.Frame(pathlib.Path(path), pk=str(pk))
+        Frame(pathlib.Path(path), pk=str(pk))
         for path, pk in zip(img_groups[group], pk_groups[group])
     ]
 
