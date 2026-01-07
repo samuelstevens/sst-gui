@@ -1,11 +1,11 @@
 {
-  "root": "/local/scratch/datasets/jiggins_segmented_bg",
+  "root": "/local/scratch/stevens.994/datasets/cambridge-segmented",
   "filter_query": "SELECT * FROM master_df",
   "group_by": [
     "Dataset"
   ],
   "img_path": "CONCAT('/local/scratch/datasets/jiggins/butterflies', RIGHT(filepath, LEN(filepath) - 6))",
   "primary_key": "Image_name",
-  "sam2": "facebook/sam2.1-hiera-large",
+  "sam2": "facebook/sam2.1-hiera-tiny",
   "device": "cuda"
 }

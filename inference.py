@@ -229,7 +229,7 @@ def main(spec: pathlib.Path, /):
         dataloader = get_dataloader(spec, frames, group, batch_size=32)
         logger.info("Got dataloader with %d batches.", len(dataloader))
 
-        for batch in lib.progress(dataloader, every=1):
+        for batch in lib.progress(dataloader):
             assert len(batch["mask_i"]) == len(batch["masks"])
             session = processor.init_video_session(
                 video=batch["imgs"],

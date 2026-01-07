@@ -319,7 +319,7 @@ def main():
     st.info(f"💾 Master CSV saved to {master_csv_path}")
 
     # Sample frames without replacement
-    rng = np.random.default_rng(seed=0)
+    rng = np.random.default_rng(seed=2)
     frame_indices = rng.choice(len(frames), size=n_ref_frames, replace=False)
     frame_indices = sorted(frame_indices)
 

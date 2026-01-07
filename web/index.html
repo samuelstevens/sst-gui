@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SST GUI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="dist/main.css" />
+</head>
+<body class="">
+  <header class="p-4">
+    <div class="flex items-center gap-2 mb-4">
+      <h1 class="text-4xl font-semibold">SST GUI</h1>
+    </div>
+  </header>
+  <main class="">
+    <div id="app"></div>
+  </main>
+  <footer class="p-4 text-sm text-gray-500">
+  </footer>
+
+  <!-- single JS payload compiled by Elm -->
+  <script src="dist/main.min.js"></script>
+  <script>
+    Elm.Main.init({ node: document.getElementById("app") });
+  </script>
+</body>
+</html>
+
