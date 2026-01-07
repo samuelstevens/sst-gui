@@ -819,6 +819,9 @@ viewMasksPage model =
     let
         currentFrame =
             List.head (List.drop model.currentFrameIndex model.frames)
+
+        selectedMaskIds =
+            Dict.keys model.selectedMasks
     in
     div []
         [ h2 [ class "text-2xl font-bold mb-4" ] [ text "Select Masks" ]
@@ -830,41 +833,46 @@ viewMasksPage model =
                         , text (" | PK: " ++ frame.pk)
                         , text (" | " ++ String.fromInt (List.length model.masks) ++ " masks")
                         ]
-                    , div [ class "grid grid-cols-2 gap-4" ]
-                        [ div []
+                    , div [ class "flex gap-4" ]
+                        [ -- Main image with overlays
+                          div [ class "flex-shrink-0" ]
                             [ case model.projectId of
                                 Just pid ->
-                                    div [ class "relative" ]
-                                        [ img
+                                    div [ class "relative inline-block" ]
+                                        (img
                                             [ src ("/api/projects/" ++ pid ++ "/frames/" ++ frame.pk ++ "/image?scale=" ++ String.fromFloat model.maskScale)
-                                            , class "max-w-full border rounded"
+                                            , class "block border rounded"
+                                            , id "base-image"
                                             ]
                                             []
-                                        , div [ class "absolute top-0 left-0" ]
-                                            (List.filterMap
-                                                (\mask ->
-                                                    if Dict.member mask.maskId model.selectedMasks then
-                                                        Just
-                                                            (img
+                                            :: List.indexedMap
+                                                (\idx maskId ->
+                                                    case List.filter (\m -> m.maskId == maskId) model.masks |> List.head of
+                                                        Just mask ->
+                                                            img
                                                                 [ src mask.url
-                                                                , class "absolute top-0 left-0 opacity-50"
-                                                                , style "mix-blend-mode" "multiply"
+                                                                , class "absolute top-0 left-0 w-full h-full object-contain pointer-events-none"
+                                                                , style "opacity" "0.6"
+                                                                , style "filter" (maskColorFilter idx)
+                                                                , style "mix-blend-mode" "screen"
                                                                 ]
                                                                 []
-                                                            )
 
-                                                    else
-                                                        Nothing
+                                                        Nothing ->
+                                                            text ""
                                                 )
-                                                model.masks
-                                            )
-                                        ]
+                                                selectedMaskIds
+                                        )
 
                                 Nothing ->
                                     text ""
                             ]
-                        , div [ class "border rounded max-h-96 overflow-y-auto" ]
-                            (List.map (viewMaskRow model) model.masks)
+
+                        -- Mask grid
+                        , div [ class "flex-1" ]
+                            [ div [ class "grid grid-cols-4 gap-2 max-h-96 overflow-y-auto p-2 border rounded bg-gray-50" ]
+                                (List.indexedMap (viewMaskThumbnail model) model.masks)
+                            ]
                         ]
                     , div [ class "mt-4 flex gap-2" ]
                         [ button
@@ -886,60 +894,80 @@ viewMasksPage model =
         ]
 
 
-viewMaskRow : Model -> MaskMeta -> Html Msg
-viewMaskRow model mask =
+maskColorFilter : Int -> String
+maskColorFilter idx =
+    let
+        -- Hue rotation values for distinct colors: orange, blue, green, pink, purple, etc.
+        hueRotations =
+            [ 0, 180, 90, 300, 270, 45, 135, 225, 315, 30 ]
+
+        hue =
+            Maybe.withDefault 0 (List.head (List.drop (modBy 10 idx) hueRotations))
+    in
+    "sepia(1) saturate(5) hue-rotate(" ++ String.fromInt hue ++ "deg)"
+
+
+viewMaskThumbnail : Model -> Int -> MaskMeta -> Html Msg
+viewMaskThumbnail model idx mask =
     let
         isSelected =
             Dict.member mask.maskId model.selectedMasks
+
+        selectedIndex =
+            List.indexedMap Tuple.pair (Dict.keys model.selectedMasks)
+                |> List.filter (\( _, id ) -> id == mask.maskId)
+                |> List.head
+                |> Maybe.map Tuple.first
 
         currentLabel =
             Dict.get mask.maskId model.selectedMasks |> Maybe.withDefault 1
     in
     div
         [ class
-            ("p-3 border-b flex items-center gap-3 "
+            ("relative cursor-pointer border-2 rounded overflow-hidden "
                 ++ (if isSelected then
-                        "bg-blue-50"
+                        "border-blue-500 ring-2 ring-blue-300"
 
                     else
-                        ""
+                        "border-gray-200 hover:border-gray-400"
                    )
             )
+        , onClick (ToggleMask mask.maskId)
         ]
-        [ input
-            [ type_ "checkbox"
-            , checked isSelected
-            , onClick (ToggleMask mask.maskId)
-            , class "w-4 h-4"
-            ]
-            []
-        , img
+        [ img
             [ src mask.url
-            , class "w-16 h-16 object-contain border rounded bg-gray-100"
+            , class "w-full aspect-square object-contain bg-gray-100"
+            , style "filter"
+                (case selectedIndex of
+                    Just i ->
+                        maskColorFilter i
+
+                    Nothing ->
+                        "none"
+                )
             ]
             []
-        , div [ class "flex-1" ]
-            [ div [ class "text-sm" ] [ text ("Mask " ++ String.fromInt mask.maskId) ]
-            , div [ class "text-xs text-gray-500" ]
-                [ text
-                    (case mask.score of
-                        Just s ->
-                            "Score: " ++ String.fromFloat (toFloat (round (s * 100)) / 100)
+        , div [ class "absolute bottom-0 left-0 right-0 bg-black bg-opacity-60 text-white text-xs p-1 flex justify-between items-center" ]
+            [ span [] [ text (String.fromInt mask.maskId) ]
+            , case mask.score of
+                Just s ->
+                    span [] [ text (String.fromFloat (toFloat (round (s * 100)) / 100)) ]
 
-                        Nothing ->
-                            ""
-                    )
-                ]
+                Nothing ->
+                    text ""
             ]
         , if isSelected then
-            input
-                [ type_ "number"
-                , Html.Attributes.min "1"
-                , value (String.fromInt currentLabel)
-                , onInput (SetMaskLabel mask.maskId)
-                , class "w-16 border rounded p-1 text-center"
+            div [ class "absolute top-1 right-1" ]
+                [ input
+                    [ type_ "number"
+                    , Html.Attributes.min "1"
+                    , value (String.fromInt currentLabel)
+                    , onInput (SetMaskLabel mask.maskId)
+                    , stopPropagationOn "click" (D.succeed ( SetMaskLabel mask.maskId (String.fromInt currentLabel), True ))
+                    , class "w-8 h-6 text-xs text-center border rounded"
+                    ]
+                    []
                 ]
-                []
 
           else
             text ""
