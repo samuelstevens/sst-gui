@@ -1,6 +1,7 @@
 module Main exposing (..)
 
 import Browser
+import Browser.Navigation as Nav
 import Dict exposing (Dict)
 import File exposing (File)
 import Html exposing (..)
@@ -10,6 +11,9 @@ import Http
 import Json.Decode as D
 import Json.Encode as E
 import Set exposing (Set)
+import Url exposing (Url)
+import Url.Parser as Parser exposing ((</>), (<?>))
+import Url.Parser.Query as Query
 
 
 
@@ -18,11 +22,13 @@ import Set exposing (Set)
 
 main : Program () Model Msg
 main =
-    Browser.element
+    Browser.application
         { init = init
         , update = update
         , subscriptions = \_ -> Sub.none
         , view = view
+        , onUrlChange = UrlChanged
+        , onUrlRequest = LinkClicked
         }
 
 
@@ -31,7 +37,9 @@ main =
 
 
 type alias Model =
-    { page : Page
+    { key : Nav.Key
+    , url : Url
+    , page : Page
     , error : Maybe String
 
     -- Project setup form
@@ -99,9 +107,29 @@ type alias MaskMeta =
     }
 
 
-init : () -> ( Model, Cmd Msg )
-init _ =
-    ( { page = SetupPage
+init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
+init _ url key =
+    let
+        route =
+            parseUrl url
+
+        ( page, projectId, cmd ) =
+            case route of
+                Just (ProjectRoute pid) ->
+                    ( GroupsPage, Just pid, fetchGroups pid )
+
+                Just (FramesRoute pid) ->
+                    ( FramesPage, Just pid, Cmd.batch [ fetchGroups pid, fetchFrames pid ] )
+
+                Just (MasksRoute pid frameIdx) ->
+                    ( FramesPage, Just pid, Cmd.batch [ fetchGroups pid, fetchFrames pid ] )
+
+                Nothing ->
+                    ( SetupPage, Nothing, Cmd.none )
+    in
+    ( { key = key
+      , url = url
+      , page = page
       , error = Nothing
       , csvFile = Nothing
       , filterQuery = "SELECT * FROM master_df"
@@ -111,7 +139,7 @@ init _ =
       , rootDpath = "/local/scratch/stevens.994/datasets/cambridge-segmented"
       , sam2Model = "facebook/sam2.1-hiera-tiny"
       , device = "cuda"
-      , projectId = Nothing
+      , projectId = projectId
       , columns = []
       , groupCount = 0
       , rowCount = 0
@@ -126,8 +154,41 @@ init _ =
       , maskScale = 0.25
       , loadingMasks = False
       }
-    , Cmd.none
+    , cmd
     )
+
+
+type Route
+    = ProjectRoute String
+    | FramesRoute String
+    | MasksRoute String Int
+
+
+parseUrl : Url -> Maybe Route
+parseUrl url =
+    Parser.parse routeParser url
+
+
+routeParser : Parser.Parser (Route -> a) a
+routeParser =
+    Parser.oneOf
+        [ Parser.map ProjectRoute (Parser.s "projects" </> Parser.string)
+        , Parser.map FramesRoute (Parser.s "projects" </> Parser.string </> Parser.s "frames")
+        , Parser.map MasksRoute (Parser.s "projects" </> Parser.string </> Parser.s "frames" </> Parser.int </> Parser.s "masks")
+        ]
+
+
+routeToUrl : Route -> String
+routeToUrl route =
+    case route of
+        ProjectRoute pid ->
+            "/projects/" ++ pid
+
+        FramesRoute pid ->
+            "/projects/" ++ pid ++ "/frames"
+
+        MasksRoute pid frameIdx ->
+            "/projects/" ++ pid ++ "/frames/" ++ String.fromInt frameIdx ++ "/masks"
 
 
 
@@ -135,8 +196,11 @@ init _ =
 
 
 type Msg
-    = -- Setup form
-      CsvSelected File
+    = -- URL navigation
+      UrlChanged Url
+    | LinkClicked Browser.UrlRequest
+      -- Setup form
+    | CsvSelected File
     | SetFilterQuery String
     | SetGroupBy String
     | SetImgPath String
@@ -148,12 +212,14 @@ type Msg
     | GotProjectCreated (Result Http.Error ProjectCreatedResponse)
       -- Groups
     | GotGroups (Result Http.Error GroupsResponse)
+    | GotProjectInfo (Result Http.Error ProjectCreatedResponse)
     | SelectGroup String
     | SetNRefFrames String
     | SetSeed String
     | SampleFrames
     | GotSampledFrames (Result Http.Error SampledFramesResponse)
       -- Frames
+    | GotFrames (Result Http.Error SampledFramesResponse)
     | GoToFrame Int
     | ComputeMasks
     | GotMasks (Result Http.Error MasksResponse)
@@ -204,6 +270,38 @@ type alias SelectionSavedResponse =
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
+        UrlChanged url ->
+            let
+                route =
+                    parseUrl url
+            in
+            case route of
+                Just (ProjectRoute pid) ->
+                    ( { model | url = url, page = GroupsPage, projectId = Just pid }
+                    , fetchGroups pid
+                    )
+
+                Just (FramesRoute pid) ->
+                    ( { model | url = url, page = FramesPage, projectId = Just pid }
+                    , fetchFrames pid
+                    )
+
+                Just (MasksRoute pid frameIdx) ->
+                    ( { model | url = url, page = MasksPage, projectId = Just pid, currentFrameIndex = frameIdx }
+                    , fetchFrames pid
+                    )
+
+                Nothing ->
+                    ( { model | url = url, page = SetupPage }, Cmd.none )
+
+        LinkClicked urlRequest ->
+            case urlRequest of
+                Browser.Internal url ->
+                    ( model, Nav.pushUrl model.key (Url.toString url) )
+
+                Browser.External href ->
+                    ( model, Nav.load href )
+
         CsvSelected file ->
             ( { model | csvFile = Just file }, Cmd.none )
 
@@ -247,7 +345,10 @@ update msg model =
                         , page = GroupsPage
                         , error = Nothing
                       }
-                    , fetchGroups resp.projectId
+                    , Cmd.batch
+                        [ fetchGroups resp.projectId
+                        , Nav.pushUrl model.key (routeToUrl (ProjectRoute resp.projectId))
+                        ]
                     )
 
                 Err err ->
@@ -257,6 +358,21 @@ update msg model =
             case result of
                 Ok resp ->
                     ( { model | groups = resp.groups, error = Nothing }, Cmd.none )
+
+                Err err ->
+                    ( { model | error = Just (httpErrorToString err) }, Cmd.none )
+
+        GotProjectInfo result ->
+            case result of
+                Ok resp ->
+                    ( { model
+                        | columns = resp.columns
+                        , groupCount = resp.groupCount
+                        , rowCount = resp.rowCount
+                        , error = Nothing
+                      }
+                    , Cmd.none
+                    )
 
                 Err err ->
                     ( { model | error = Just (httpErrorToString err) }, Cmd.none )
@@ -281,16 +397,29 @@ update msg model =
         GotSampledFrames result ->
             case result of
                 Ok resp ->
-                    ( { model
-                        | frames = resp.frames
-                        , currentFrameIndex = 0
-                        , page = FramesPage
-                        , error = Nothing
-                        , masks = []
-                        , selectedMasks = Dict.empty
-                      }
-                    , Cmd.none
-                    )
+                    case model.projectId of
+                        Just pid ->
+                            ( { model
+                                | frames = resp.frames
+                                , currentFrameIndex = 0
+                                , page = FramesPage
+                                , error = Nothing
+                                , masks = []
+                                , selectedMasks = Dict.empty
+                              }
+                            , Nav.pushUrl model.key (routeToUrl (FramesRoute pid))
+                            )
+
+                        Nothing ->
+                            ( { model | error = Just "No project ID" }, Cmd.none )
+
+                Err err ->
+                    ( { model | error = Just (httpErrorToString err) }, Cmd.none )
+
+        GotFrames result ->
+            case result of
+                Ok resp ->
+                    ( { model | frames = resp.frames, error = Nothing }, Cmd.none )
 
                 Err err ->
                     ( { model | error = Just (httpErrorToString err) }, Cmd.none )
@@ -324,14 +453,19 @@ update msg model =
         GotMasks result ->
             case result of
                 Ok resp ->
-                    ( { model
-                        | masks = resp.masks
-                        , loadingMasks = False
-                        , page = MasksPage
-                        , error = Nothing
-                      }
-                    , Cmd.none
-                    )
+                    case model.projectId of
+                        Just pid ->
+                            ( { model
+                                | masks = resp.masks
+                                , loadingMasks = False
+                                , page = MasksPage
+                                , error = Nothing
+                              }
+                            , Nav.pushUrl model.key (routeToUrl (MasksRoute pid model.currentFrameIndex))
+                            )
+
+                        Nothing ->
+                            ( { model | masks = resp.masks, loadingMasks = False, page = MasksPage, error = Nothing }, Cmd.none )
 
                 Err err ->
                     ( { model | error = Just (httpErrorToString err), loadingMasks = False }, Cmd.none )
@@ -375,32 +509,45 @@ update msg model =
                         nextIndex =
                             model.currentFrameIndex + 1
                     in
-                    if nextIndex < List.length model.frames then
-                        ( { model
-                            | currentFrameIndex = nextIndex
-                            , masks = []
-                            , selectedMasks = Dict.empty
-                            , page = FramesPage
-                            , error = Nothing
-                          }
-                        , Cmd.none
-                        )
+                    case model.projectId of
+                        Just pid ->
+                            if nextIndex < List.length model.frames then
+                                ( { model
+                                    | currentFrameIndex = nextIndex
+                                    , masks = []
+                                    , selectedMasks = Dict.empty
+                                    , page = FramesPage
+                                    , error = Nothing
+                                  }
+                                , Nav.pushUrl model.key (routeToUrl (FramesRoute pid))
+                                )
 
-                    else
-                        ( { model
-                            | error = Nothing
-                            , page = GroupsPage
-                            , masks = []
-                            , selectedMasks = Dict.empty
-                          }
-                        , Cmd.none
-                        )
+                            else
+                                ( { model
+                                    | error = Nothing
+                                    , page = GroupsPage
+                                    , masks = []
+                                    , selectedMasks = Dict.empty
+                                  }
+                                , Nav.pushUrl model.key (routeToUrl (ProjectRoute pid))
+                                )
+
+                        Nothing ->
+                            ( model, Cmd.none )
 
                 Err err ->
                     ( { model | error = Just (httpErrorToString err) }, Cmd.none )
 
         GoToPage page ->
-            ( { model | page = page }, Cmd.none )
+            case ( page, model.projectId ) of
+                ( GroupsPage, Just pid ) ->
+                    ( { model | page = page }, Nav.pushUrl model.key (routeToUrl (ProjectRoute pid)) )
+
+                ( FramesPage, Just pid ) ->
+                    ( { model | page = page }, Nav.pushUrl model.key (routeToUrl (FramesRoute pid)) )
+
+                _ ->
+                    ( { model | page = page }, Cmd.none )
 
         DismissError ->
             ( { model | error = Nothing }, Cmd.none )
@@ -438,6 +585,14 @@ fetchGroups projectId =
     Http.get
         { url = "/api/projects/" ++ projectId ++ "/groups?limit=1000"
         , expect = Http.expectJson GotGroups groupsDecoder
+        }
+
+
+fetchFrames : String -> Cmd Msg
+fetchFrames projectId =
+    Http.get
+        { url = "/api/projects/" ++ projectId ++ "/frames"
+        , expect = Http.expectJson GotFrames sampledFramesDecoder
         }
 
 
@@ -594,23 +749,27 @@ httpErrorToString err =
 -- VIEW
 
 
-view : Model -> Html Msg
+view : Model -> Browser.Document Msg
 view model =
-    div [ class "max-w-6xl mx-auto p-4" ]
-        [ viewError model.error
-        , case model.page of
-            SetupPage ->
-                viewSetupPage model
+    { title = "SST GUI"
+    , body =
+        [ div [ class "max-w-6xl mx-auto p-4" ]
+            [ viewError model.error
+            , case model.page of
+                SetupPage ->
+                    viewSetupPage model
 
-            GroupsPage ->
-                viewGroupsPage model
+                GroupsPage ->
+                    viewGroupsPage model
 
-            FramesPage ->
-                viewFramesPage model
+                FramesPage ->
+                    viewFramesPage model
 
-            MasksPage ->
-                viewMasksPage model
+                MasksPage ->
+                    viewMasksPage model
+            ]
         ]
+    }
 
 
 viewError : Maybe String -> Html Msg

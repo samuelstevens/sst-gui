@@ -559,6 +559,19 @@ async def index() -> Response:
     return Response(content=index_fpath.read_bytes(), media_type="text/html")
 
 
+@get("/projects/{path:path}")
+@beartype.beartype
+async def spa_fallback(path: str) -> Response:
+    """Serve index.html for client-side routing paths."""
+    if not index_fpath.exists():
+        return Response(
+            content=b"index.html not found",
+            media_type="text/plain",
+            status_code=404,
+        )
+    return Response(content=index_fpath.read_bytes(), media_type="text/html")
+
+
 def create_app() -> Litestar:
     dist_router = create_static_files_router(
         path="/dist",
@@ -581,6 +594,7 @@ def create_app() -> Litestar:
             get_spec,
             health,
             index,
+            spa_fallback,
             dist_router,
         ],
         request_max_body_size=100 * 1024 * 1024,  # 100MB
