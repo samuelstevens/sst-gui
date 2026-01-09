@@ -9,19 +9,6 @@
 - Variables referring to a absolute filepath should be suffixed with `_fpath`. Filenames are `_fname`. Directories are `_dpath`.
 - submitit and jaxtyping don't work in the same file. See [this issue](https://github.com/patrick-kidger/jaxtyping/issues/332). To solve this, all jaxtyped functions/classes need to be in a different file to the submitit launcher script.
 
-# Tensor Variables
+# Test Data
 
-Throughout the code, variables are annotated with shape suffixes, as [recommended by Noam Shazeer](https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd).
-
-The key for these suffixes:
-
-* B: batch size
-* W: width in patches (typically 14 or 16)
-* H: height in patches (typically 14 or 16)
-* D: ViT activation dimension (typically 768 or 1024)
-* S: SAE latent dimension (768 x 16, etc)
-* L: Number of latents being manipulated at once (typically 1-5 at a time)
-* C: Number of classes in ADE20K (151)
-
-For example, an activation tensor with shape (batch, width, height d_vit) is `acts_BWHD`.
-
+- CSV file for testing: `/local/scratch/stevens.994/datasets/cambridge-segmented/master.csv`

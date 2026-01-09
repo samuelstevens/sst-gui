@@ -1,24 +1,24 @@
-import asyncio
 import base64
 import functools
 import io
 import pathlib
 import random
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import beartype
 import duckdb
 import numpy as np
 import polars as pl
-import transformers
+import torch
 from litestar import Litestar, Request, Response, get, post
 from litestar.datastructures import UploadFile
 from litestar.exceptions import HTTPException
 from litestar.static_files import create_static_files_router
 from PIL import Image
 from pydantic import BaseModel
+from transformers import pipeline
 
 
 class ProjectConfig(BaseModel):
@@ -94,44 +94,56 @@ _PROJECTS: dict[str, ProjectState] = {}
 _MASK_PREVIEWS: dict[tuple[str, str, float], list[bytes]] = {}
 _FULL_MASKS: dict[tuple[str, str], list[np.ndarray]] = {}  # full-res masks for saving
 _BASE_PREVIEWS: dict[tuple[str, str, float], bytes] = {}
-_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
-_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+_MASK_COMPUTE_LOCK = threading.Lock()  # Prevents duplicate mask computation
+
+DEFAULT_MASK_SCALE = 0.25
 dist_dpath = pathlib.Path(__file__).parent / "dist"
 index_fpath = pathlib.Path(__file__).parent / "web" / "index.html"
 
 
 @functools.lru_cache(maxsize=1)
-def load_pipeline(model: str, device: str):
-    return transformers.pipeline("mask-generation", model=model, device=device)
+def load_sam2_pipeline(model_name: str, device: str):
+    """Load SAM2 pipeline (cached)."""
+    # Enable TF32 for better performance on Ampere GPUs
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    return pipeline(
+        "mask-generation",
+        model=model_name,
+        device=device,
+        points_per_batch=256,
+    )
 
 
 @beartype.beartype
 def generate_masks_sync(
-    model: str, device: str, img_fpath: pathlib.Path, scale: float
+    sam2_model: str, device: str, img_fpath: pathlib.Path, scale: float
 ) -> tuple[list[np.ndarray], list[bytes], list[float], list[int]]:
     """Run SAM2 inference synchronously (called from thread pool).
 
     Returns (full_masks, preview_pngs, scores, areas).
     """
-    pipeline = load_pipeline(model, device)
+    generator = load_sam2_pipeline(sam2_model, device)
+
     with Image.open(img_fpath) as img:
         img = img.convert("RGB")
         orig_w, orig_h = img.size
-        output = pipeline(img, points_per_batch=64)
-
-    masks = output["masks"]
-    scores = [float(s) for s in output.get("scores", [0.0] * len(masks))]
+        outputs = generator(img, points_per_batch=256)
 
     full_masks: list[np.ndarray] = []
     preview_pngs: list[bytes] = []
+    scores: list[float] = []
     areas: list[int] = []
 
     new_w = max(1, int(orig_w * scale))
     new_h = max(1, int(orig_h * scale))
 
-    for mask in masks:
-        mask_arr = np.array(mask, dtype=np.uint8)
+    for item in outputs["masks"]:
+        mask_arr = np.array(item, dtype=np.uint8)
         full_masks.append(mask_arr)
+        scores.append(float(item.get("score", 0.0)) if hasattr(item, "get") else 0.0)
         areas.append(int(mask_arr.sum()))
         mask_img = Image.fromarray(mask_arr * 255)
         mask_scaled = mask_img.resize((new_w, new_h), Image.Resampling.NEAREST)
@@ -155,12 +167,6 @@ def get_project_or_404(project_id: str) -> ProjectState:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project
-
-
-@beartype.beartype
-def get_lock(project_id: str, pk: str) -> asyncio.Lock:
-    key = (project_id, pk)
-    return _LOCKS.setdefault(key, asyncio.Lock())
 
 
 @beartype.beartype
@@ -207,7 +213,7 @@ async def create_project(request: Request) -> Response:
     img_path = str(form.get("img_path", "")).strip()
     primary_key = str(form.get("primary_key", "")).strip()
     root_dpath = str(form.get("root_dpath", "")).strip()
-    sam2_model = str(form.get("sam2_model", "")).strip()
+    sam2_model = str(form.get("sam2_model", "facebook/sam2.1-hiera-tiny")).strip()
     device = str(form.get("device", "")).strip()
 
     if not group_by_raw:
@@ -350,6 +356,7 @@ async def sample_group(
     rng = random.Random(seed)
     sample = rng.sample(frames, k=n_ref_frames)
     project.sampled_frames[group_key] = sample
+
     return {
         "frames": [
             FrameSummary(pk=frame.pk, img_path=frame.img_path).model_dump()
@@ -425,21 +432,25 @@ def build_masks_response(
     )
 
 
-@post("/api/projects/{project_id:str}/frames/{pk:str}/masks")
-@beartype.beartype
-async def compute_masks(project_id: str, pk: str, request: Request) -> Response:
-    project = get_project_or_404(project_id)
+class ComputeMasksRequest(BaseModel):
+    scale: float = 0.25
 
-    payload = await request.json()
-    scale = float(payload.get("scale", 0.25))
+
+@post("/api/projects/{project_id:str}/frames/{pk:str}/masks", sync_to_thread=True)
+@beartype.beartype
+def compute_masks(project_id: str, pk: str, data: ComputeMasksRequest) -> Response:
+    project = get_project_or_404(project_id)
+    scale = data.scale
     cache_key = (project_id, pk, scale)
+
+    # Return cached if available
     if cache_key in _MASK_PREVIEWS:
         previews = _MASK_PREVIEWS[cache_key]
         response = build_masks_response(project_id, pk, scale, len(previews), [], [])
         return Response(content=response.model_dump(), status_code=200)
 
-    lock = get_lock(project_id, pk)
-    async with lock:
+    with _MASK_COMPUTE_LOCK:
+        # Double-check after acquiring lock
         if cache_key in _MASK_PREVIEWS:
             previews = _MASK_PREVIEWS[cache_key]
             response = build_masks_response(
@@ -455,10 +466,7 @@ async def compute_masks(project_id: str, pk: str, request: Request) -> Response:
         if not img_fpath.exists():
             raise HTTPException(status_code=404, detail="image not found")
 
-        loop = asyncio.get_event_loop()
-        full_masks, preview_pngs, scores, areas = await loop.run_in_executor(
-            _EXECUTOR,
-            generate_masks_sync,
+        full_masks, preview_pngs, scores, areas = generate_masks_sync(
             project.config.sam2_model,
             project.config.device,
             img_fpath,
@@ -559,19 +567,6 @@ async def index() -> Response:
     return Response(content=index_fpath.read_bytes(), media_type="text/html")
 
 
-@get("/projects/{path:path}")
-@beartype.beartype
-async def spa_fallback(path: str) -> Response:
-    """Serve index.html for client-side routing paths."""
-    if not index_fpath.exists():
-        return Response(
-            content=b"index.html not found",
-            media_type="text/plain",
-            status_code=404,
-        )
-    return Response(content=index_fpath.read_bytes(), media_type="text/html")
-
-
 def create_app() -> Litestar:
     dist_router = create_static_files_router(
         path="/dist",
@@ -594,7 +589,6 @@ def create_app() -> Litestar:
             get_spec,
             health,
             index,
-            spa_fallback,
             dist_router,
         ],
         request_max_body_size=100 * 1024 * 1024,  # 100MB

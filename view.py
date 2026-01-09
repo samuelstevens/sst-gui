@@ -28,16 +28,19 @@ colors = np.array([
 ])
 
 
-def main(img: pathlib.Path, /):
-    img = Image.open(img)
-    w, h = img.size
+def main(imgs: list[pathlib.Path], /):
+    for img in imgs:
+        if len(imgs) > 1:
+            print(img)
+        img = Image.open(img)
+        w, h = img.size
 
-    mono = np.array(img)
-    rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    for color, i in zip(colors, sorted(np.unique(mono).tolist())):
-        rgb[mono == i, :] = color
-    img = term_image.image.AutoImage(Image.fromarray(rgb))
-    img.draw()
+        mono = np.array(img)
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        for color, i in zip(colors, sorted(np.unique(mono).tolist())):
+            rgb[mono == i, :] = color
+        img = term_image.image.AutoImage(Image.fromarray(rgb))
+        img.draw()
 
 
 if __name__ == "__main__":

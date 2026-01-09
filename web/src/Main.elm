@@ -81,7 +81,6 @@ type alias Model =
 type Page
     = SetupPage
     | GroupsPage
-    | FramesPage
     | MasksPage
 
 
@@ -113,23 +112,27 @@ init _ url key =
         route =
             parseUrl url
 
-        ( page, projectId, cmd ) =
+        initState =
             case route of
                 Just (ProjectRoute pid) ->
-                    ( GroupsPage, Just pid, fetchGroups pid )
+                    { page = GroupsPage, projectId = Just pid, frameIdx = 0, cmd = fetchGroups pid }
 
-                Just (FramesRoute pid) ->
-                    ( FramesPage, Just pid, Cmd.batch [ fetchGroups pid, fetchFrames pid ] )
+                Just (FramesRoute pid idx) ->
+                    -- Treat FramesRoute same as MasksRoute (merged pages)
+                    { page = MasksPage, projectId = Just pid, frameIdx = idx, cmd = Cmd.batch [ fetchGroups pid, fetchFrames pid ] }
 
-                Just (MasksRoute pid frameIdx) ->
-                    ( FramesPage, Just pid, Cmd.batch [ fetchGroups pid, fetchFrames pid ] )
+                Just (MasksRoute pid idx) ->
+                    { page = MasksPage, projectId = Just pid, frameIdx = idx, cmd = Cmd.batch [ fetchGroups pid, fetchFrames pid ] }
+
+                Just SetupRoute ->
+                    { page = SetupPage, projectId = Nothing, frameIdx = 0, cmd = Cmd.none }
 
                 Nothing ->
-                    ( SetupPage, Nothing, Cmd.none )
+                    { page = SetupPage, projectId = Nothing, frameIdx = 0, cmd = Cmd.none }
     in
     ( { key = key
       , url = url
-      , page = page
+      , page = initState.page
       , error = Nothing
       , csvFile = Nothing
       , filterQuery = "SELECT * FROM master_df"
@@ -139,7 +142,7 @@ init _ url key =
       , rootDpath = "/local/scratch/stevens.994/datasets/cambridge-segmented"
       , sam2Model = "facebook/sam2.1-hiera-tiny"
       , device = "cuda"
-      , projectId = projectId
+      , projectId = initState.projectId
       , columns = []
       , groupCount = 0
       , rowCount = 0
@@ -148,47 +151,79 @@ init _ url key =
       , nRefFrames = "5"
       , seed = "0"
       , frames = []
-      , currentFrameIndex = 0
+      , currentFrameIndex = initState.frameIdx
       , masks = []
       , selectedMasks = Dict.empty
       , maskScale = 0.25
       , loadingMasks = False
       }
-    , cmd
+    , initState.cmd
     )
 
 
 type Route
-    = ProjectRoute String
-    | FramesRoute String
+    = SetupRoute
+    | ProjectRoute String
+    | FramesRoute String Int
     | MasksRoute String Int
 
 
 parseUrl : Url -> Maybe Route
 parseUrl url =
-    Parser.parse routeParser url
+    let
+        params =
+            Maybe.withDefault "" url.query
+                |> String.split "&"
+                |> List.filterMap
+                    (\s ->
+                        case String.split "=" s of
+                            [ k, v ] ->
+                                Just ( k, Url.percentDecode v |> Maybe.withDefault v )
 
+                            _ ->
+                                Nothing
+                    )
+                |> Dict.fromList
 
-routeParser : Parser.Parser (Route -> a) a
-routeParser =
-    Parser.oneOf
-        [ Parser.map ProjectRoute (Parser.s "projects" </> Parser.string)
-        , Parser.map FramesRoute (Parser.s "projects" </> Parser.string </> Parser.s "frames")
-        , Parser.map MasksRoute (Parser.s "projects" </> Parser.string </> Parser.s "frames" </> Parser.int </> Parser.s "masks")
-        ]
+        projectId =
+            Dict.get "project" params
+
+        page =
+            Dict.get "page" params |> Maybe.withDefault "setup"
+
+        frameIdx =
+            Dict.get "frame" params |> Maybe.andThen String.toInt |> Maybe.withDefault 0
+    in
+    case ( projectId, page ) of
+        ( Just pid, "groups" ) ->
+            Just (ProjectRoute pid)
+
+        ( Just pid, "frames" ) ->
+            -- Treat "frames" as "masks" (merged pages)
+            Just (MasksRoute pid frameIdx)
+
+        ( Just pid, "masks" ) ->
+            Just (MasksRoute pid frameIdx)
+
+        _ ->
+            Just SetupRoute
 
 
 routeToUrl : Route -> String
 routeToUrl route =
     case route of
-        ProjectRoute pid ->
-            "/projects/" ++ pid
+        SetupRoute ->
+            "/"
 
-        FramesRoute pid ->
-            "/projects/" ++ pid ++ "/frames"
+        ProjectRoute pid ->
+            "/?project=" ++ Url.percentEncode pid ++ "&page=groups"
+
+        FramesRoute pid frameIdx ->
+            -- Redirect to masks (merged pages)
+            "/?project=" ++ Url.percentEncode pid ++ "&page=masks&frame=" ++ String.fromInt frameIdx
 
         MasksRoute pid frameIdx ->
-            "/projects/" ++ pid ++ "/frames/" ++ String.fromInt frameIdx ++ "/masks"
+            "/?project=" ++ Url.percentEncode pid ++ "&page=masks&frame=" ++ String.fromInt frameIdx
 
 
 
@@ -281,15 +316,36 @@ update msg model =
                     , fetchGroups pid
                     )
 
-                Just (FramesRoute pid) ->
-                    ( { model | url = url, page = FramesPage, projectId = Just pid }
-                    , fetchFrames pid
+                Just (FramesRoute pid idx) ->
+                    -- Treat FramesRoute same as MasksRoute (merged pages)
+                    let
+                        cmd =
+                            if List.isEmpty model.frames then
+                                fetchFrames pid
+
+                            else
+                                Cmd.none
+                    in
+                    ( { model | url = url, page = MasksPage, projectId = Just pid, currentFrameIndex = idx }
+                    , cmd
                     )
 
-                Just (MasksRoute pid frameIdx) ->
-                    ( { model | url = url, page = MasksPage, projectId = Just pid, currentFrameIndex = frameIdx }
-                    , fetchFrames pid
+                Just (MasksRoute pid idx) ->
+                    -- Only fetch frames if we don't have them
+                    let
+                        cmd =
+                            if List.isEmpty model.frames then
+                                fetchFrames pid
+
+                            else
+                                Cmd.none
+                    in
+                    ( { model | url = url, page = MasksPage, projectId = Just pid, currentFrameIndex = idx }
+                    , cmd
                     )
+
+                Just SetupRoute ->
+                    ( { model | url = url, page = SetupPage }, Cmd.none )
 
                 Nothing ->
                     ( { model | url = url, page = SetupPage }, Cmd.none )
@@ -399,15 +455,25 @@ update msg model =
                 Ok resp ->
                     case model.projectId of
                         Just pid ->
+                            -- Go directly to MasksPage
                             ( { model
                                 | frames = resp.frames
                                 , currentFrameIndex = 0
-                                , page = FramesPage
+                                , page = MasksPage
                                 , error = Nothing
                                 , masks = []
                                 , selectedMasks = Dict.empty
+                                , loadingMasks = True
                               }
-                            , Nav.pushUrl model.key (routeToUrl (FramesRoute pid))
+                            , Cmd.batch
+                                [ Nav.pushUrl model.key (routeToUrl (MasksRoute pid 0))
+                                , case List.head resp.frames of
+                                    Just frame ->
+                                        computeMasks pid frame.pk model.maskScale
+
+                                    Nothing ->
+                                        Cmd.none
+                                ]
                             )
 
                         Nothing ->
@@ -419,6 +485,7 @@ update msg model =
         GotFrames result ->
             case result of
                 Ok resp ->
+                    -- Just update frames, never auto-compute masks (user clicks Compute Masks button)
                     ( { model | frames = resp.frames, error = Nothing }, Cmd.none )
 
                 Err err ->
@@ -426,13 +493,28 @@ update msg model =
 
         GoToFrame idx ->
             if idx >= 0 && idx < List.length model.frames then
-                ( { model
-                    | currentFrameIndex = idx
-                    , masks = []
-                    , selectedMasks = Dict.empty
-                  }
-                , Cmd.none
-                )
+                -- Navigate to frame and auto-compute masks
+                case model.projectId of
+                    Just pid ->
+                        ( { model
+                            | currentFrameIndex = idx
+                            , masks = []
+                            , selectedMasks = Dict.empty
+                            , loadingMasks = True
+                          }
+                        , Cmd.batch
+                            [ Nav.pushUrl model.key (routeToUrl (MasksRoute pid idx))
+                            , case List.head (List.drop idx model.frames) of
+                                Just frame ->
+                                    computeMasks pid frame.pk model.maskScale
+
+                                Nothing ->
+                                    Cmd.none
+                            ]
+                        )
+
+                    Nothing ->
+                        ( model, Cmd.none )
 
             else
                 ( model, Cmd.none )
@@ -442,7 +524,10 @@ update msg model =
                 Just pid ->
                     case List.head (List.drop model.currentFrameIndex model.frames) of
                         Just frame ->
-                            ( { model | loadingMasks = True }, computeMasks pid frame.pk model.maskScale )
+                            -- Just compute masks, no URL change (page state is internal)
+                            ( { model | loadingMasks = True, page = MasksPage }
+                            , computeMasks pid frame.pk model.maskScale
+                            )
 
                         Nothing ->
                             ( model, Cmd.none )
@@ -453,19 +538,15 @@ update msg model =
         GotMasks result ->
             case result of
                 Ok resp ->
-                    case model.projectId of
-                        Just pid ->
-                            ( { model
-                                | masks = resp.masks
-                                , loadingMasks = False
-                                , page = MasksPage
-                                , error = Nothing
-                              }
-                            , Nav.pushUrl model.key (routeToUrl (MasksRoute pid model.currentFrameIndex))
-                            )
-
-                        Nothing ->
-                            ( { model | masks = resp.masks, loadingMasks = False, page = MasksPage, error = Nothing }, Cmd.none )
+                    -- Just update masks, URL was already pushed from ComputeMasks or init
+                    ( { model
+                        | masks = resp.masks
+                        , loadingMasks = False
+                        , page = MasksPage
+                        , error = Nothing
+                      }
+                    , Cmd.none
+                    )
 
                 Err err ->
                     ( { model | error = Just (httpErrorToString err), loadingMasks = False }, Cmd.none )
@@ -477,12 +558,13 @@ update msg model =
                         Dict.remove maskId model.selectedMasks
 
                     else
-                        Dict.insert maskId 1 model.selectedMasks
+                        -- Auto-assign next label (A=0, B=1, C=2, etc.)
+                        Dict.insert maskId (Dict.size model.selectedMasks) model.selectedMasks
             in
             ( { model | selectedMasks = newSelected }, Cmd.none )
 
         SetMaskLabel maskId labelStr ->
-            case String.toInt labelStr of
+            case letterToIndex labelStr of
                 Just label ->
                     ( { model | selectedMasks = Dict.insert maskId label model.selectedMasks }, Cmd.none )
 
@@ -512,17 +594,28 @@ update msg model =
                     case model.projectId of
                         Just pid ->
                             if nextIndex < List.length model.frames then
+                                -- Go to next frame and auto-compute masks
                                 ( { model
                                     | currentFrameIndex = nextIndex
                                     , masks = []
                                     , selectedMasks = Dict.empty
-                                    , page = FramesPage
+                                    , page = MasksPage
                                     , error = Nothing
+                                    , loadingMasks = True
                                   }
-                                , Nav.pushUrl model.key (routeToUrl (FramesRoute pid))
+                                , Cmd.batch
+                                    [ Nav.pushUrl model.key (routeToUrl (MasksRoute pid nextIndex))
+                                    , case List.head (List.drop nextIndex model.frames) of
+                                        Just frame ->
+                                            computeMasks pid frame.pk model.maskScale
+
+                                        Nothing ->
+                                            Cmd.none
+                                    ]
                                 )
 
                             else
+                                -- All frames done, go back to groups
                                 ( { model
                                     | error = Nothing
                                     , page = GroupsPage
@@ -543,8 +636,8 @@ update msg model =
                 ( GroupsPage, Just pid ) ->
                     ( { model | page = page }, Nav.pushUrl model.key (routeToUrl (ProjectRoute pid)) )
 
-                ( FramesPage, Just pid ) ->
-                    ( { model | page = page }, Nav.pushUrl model.key (routeToUrl (FramesRoute pid)) )
+                ( MasksPage, Just pid ) ->
+                    ( { model | page = page }, Nav.pushUrl model.key (routeToUrl (MasksRoute pid model.currentFrameIndex)) )
 
                 _ ->
                     ( { model | page = page }, Cmd.none )
@@ -642,8 +735,9 @@ saveSelection projectId pk selectedMasks =
         maskIds =
             List.map Tuple.first items
 
+        -- Add 1 to labels since backend uses 0 as background
         labels =
-            List.map Tuple.second items
+            List.map (\( _, label ) -> label + 1) items
     in
     Http.request
         { method = "POST"
@@ -761,9 +855,6 @@ view model =
 
                 GroupsPage ->
                     viewGroupsPage model
-
-                FramesPage ->
-                    viewFramesPage model
 
                 MasksPage ->
                     viewMasksPage model
@@ -981,64 +1072,107 @@ viewMasksPage model =
 
         selectedMaskIds =
             Dict.keys model.selectedMasks
+
+        hasPrev =
+            model.currentFrameIndex > 0
+
+        hasNext =
+            model.currentFrameIndex < List.length model.frames - 1
     in
     div []
         [ h2 [ class "text-2xl font-bold mb-4" ] [ text "Select Masks" ]
         , case currentFrame of
             Just frame ->
                 div []
-                    [ div [ class "mb-4 text-sm text-gray-600" ]
-                        [ text ("Frame " ++ String.fromInt (model.currentFrameIndex + 1) ++ " of " ++ String.fromInt (List.length model.frames))
-                        , text (" | PK: " ++ frame.pk)
-                        , text (" | " ++ String.fromInt (List.length model.masks) ++ " masks")
-                        ]
-                    , div [ class "flex gap-4" ]
-                        [ -- Main image with overlays
-                          div [ class "flex-shrink-0" ]
-                            [ case model.projectId of
-                                Just pid ->
-                                    div [ class "relative inline-block" ]
-                                        (img
-                                            [ src ("/api/projects/" ++ pid ++ "/frames/" ++ frame.pk ++ "/image?scale=" ++ String.fromFloat model.maskScale)
-                                            , class "block border rounded"
-                                            , id "base-image"
-                                            ]
-                                            []
-                                            :: List.indexedMap
-                                                (\idx maskId ->
-                                                    case List.filter (\m -> m.maskId == maskId) model.masks |> List.head of
-                                                        Just mask ->
-                                                            img
-                                                                [ src mask.url
-                                                                , class "absolute top-0 left-0 w-full h-full object-contain pointer-events-none"
-                                                                , style "opacity" "0.6"
-                                                                , style "filter" (maskColorFilter idx)
-                                                                , style "mix-blend-mode" "screen"
-                                                                ]
-                                                                []
-
-                                                        Nothing ->
-                                                            text ""
-                                                )
-                                                selectedMaskIds
-                                        )
-
-                                Nothing ->
-                                    text ""
+                    [ -- Frame info and navigation
+                      div [ class "mb-4 flex items-center justify-between" ]
+                        [ div [ class "text-sm text-gray-600" ]
+                            [ text ("Frame " ++ String.fromInt (model.currentFrameIndex + 1) ++ " of " ++ String.fromInt (List.length model.frames))
+                            , text (" | PK: " ++ frame.pk)
+                            , text (" | " ++ String.fromInt (List.length model.masks) ++ " masks")
                             ]
-
-                        -- Mask grid
-                        , div [ class "flex-1" ]
-                            [ div [ class "grid grid-cols-4 gap-2 max-h-96 overflow-y-auto p-2 border rounded bg-gray-50" ]
-                                (List.indexedMap (viewMaskThumbnail model) model.masks)
+                        , div [ class "flex gap-2" ]
+                            [ button
+                                [ onClick (GoToFrame (model.currentFrameIndex - 1))
+                                , disabled (not hasPrev)
+                                , class "bg-gray-200 px-3 py-1 rounded hover:bg-gray-300 disabled:opacity-50"
+                                ]
+                                [ text "← Prev" ]
+                            , button
+                                [ onClick (GoToFrame (model.currentFrameIndex + 1))
+                                , disabled (not hasNext)
+                                , class "bg-gray-200 px-3 py-1 rounded hover:bg-gray-300 disabled:opacity-50"
+                                ]
+                                [ text "Next →" ]
                             ]
                         ]
+                    , if model.loadingMasks then
+                        div [ class "text-center py-8" ]
+                            [ text "Computing masks..." ]
+
+                      else if List.isEmpty model.masks then
+                        div [ class "text-center py-8" ]
+                            [ button
+                                [ onClick ComputeMasks
+                                , class "bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
+                                ]
+                                [ text "Compute Masks" ]
+                            ]
+
+                      else
+                        div [ class "flex gap-4" ]
+                            [ -- Main image with overlays
+                              div [ class "flex-1 min-w-0" ]
+                                [ case model.projectId of
+                                    Just pid ->
+                                        div [ class "relative inline-block max-w-full" ]
+                                            (img
+                                                [ src ("/api/projects/" ++ pid ++ "/frames/" ++ frame.pk ++ "/image?scale=" ++ String.fromFloat model.maskScale)
+                                                , class "block border rounded max-w-full"
+                                                , id "base-image"
+                                                ]
+                                                []
+                                                :: List.filterMap
+                                                    (\maskId ->
+                                                        case List.filter (\m -> m.maskId == maskId) model.masks |> List.head of
+                                                            Just mask ->
+                                                                let
+                                                                    label =
+                                                                        Dict.get maskId model.selectedMasks |> Maybe.withDefault 0
+                                                                in
+                                                                Just
+                                                                    (img
+                                                                        [ src mask.url
+                                                                        , class "absolute top-0 left-0 w-full h-full object-contain pointer-events-none"
+                                                                        , style "opacity" "0.8"
+                                                                        , style "filter" (maskColorFilter label)
+                                                                        , style "mix-blend-mode" "screen"
+                                                                        ]
+                                                                        []
+                                                                    )
+
+                                                            Nothing ->
+                                                                Nothing
+                                                    )
+                                                    selectedMaskIds
+                                            )
+
+                                    Nothing ->
+                                        text ""
+                                ]
+
+                            -- Mask grid
+                            , div [ class "flex-1 min-w-0" ]
+                                [ div [ class "grid grid-cols-4 gap-2 max-h-96 overflow-y-auto p-2 border rounded bg-gray-50" ]
+                                    (List.indexedMap (viewMaskThumbnail model) model.masks)
+                                ]
+                            ]
                     , div [ class "mt-4 flex gap-2" ]
                         [ button
-                            [ onClick (GoToPage FramesPage)
+                            [ onClick (GoToPage GroupsPage)
                             , class "bg-gray-200 px-4 py-2 rounded hover:bg-gray-300"
                             ]
-                            [ text "Back" ]
+                            [ text "Back to Groups" ]
                         , button
                             [ onClick SaveSelection
                             , disabled (Dict.isEmpty model.selectedMasks)
@@ -1053,17 +1187,59 @@ viewMasksPage model =
         ]
 
 
+
+-- Convert mask index to letter (0→A, 1→B, ... 25→Z, 26→AA, 27→AB, ...)
+
+
+indexToLetter : Int -> String
+indexToLetter idx =
+    if idx < 26 then
+        String.fromChar (Char.fromCode (65 + idx))
+
+    else
+        indexToLetter (idx // 26 - 1) ++ String.fromChar (Char.fromCode (65 + modBy 26 idx))
+
+
+
+-- Convert letter back to index (A→0, B→1, ... Z→25, AA→26, AB→27, ...)
+
+
+letterToIndex : String -> Maybe Int
+letterToIndex str =
+    let
+        upper =
+            String.toUpper str
+
+        chars =
+            String.toList upper
+
+        charToVal c =
+            Char.toCode c - 65
+    in
+    if List.all (\c -> c >= 'A' && c <= 'Z') chars && not (List.isEmpty chars) then
+        Just
+            (List.foldl
+                (\c acc -> acc * 26 + charToVal c + 1)
+                0
+                chars
+                - 1
+            )
+
+    else
+        Nothing
+
+
 maskColorFilter : Int -> String
-maskColorFilter idx =
+maskColorFilter maskId =
     let
         -- Hue rotation values for distinct colors: orange, blue, green, pink, purple, etc.
         hueRotations =
             [ 0, 180, 90, 300, 270, 45, 135, 225, 315, 30 ]
 
         hue =
-            Maybe.withDefault 0 (List.head (List.drop (modBy 10 idx) hueRotations))
+            Maybe.withDefault 0 (List.head (List.drop (modBy 10 maskId) hueRotations))
     in
-    "sepia(1) saturate(5) hue-rotate(" ++ String.fromInt hue ++ "deg)"
+    "sepia(1) saturate(20) brightness(1.5) hue-rotate(" ++ String.fromInt hue ++ "deg)"
 
 
 viewMaskThumbnail : Model -> Int -> MaskMeta -> Html Msg
@@ -1071,12 +1247,6 @@ viewMaskThumbnail model idx mask =
     let
         isSelected =
             Dict.member mask.maskId model.selectedMasks
-
-        selectedIndex =
-            List.indexedMap Tuple.pair (Dict.keys model.selectedMasks)
-                |> List.filter (\( _, id ) -> id == mask.maskId)
-                |> List.head
-                |> Maybe.map Tuple.first
 
         currentLabel =
             Dict.get mask.maskId model.selectedMasks |> Maybe.withDefault 1
@@ -1097,12 +1267,11 @@ viewMaskThumbnail model idx mask =
             [ src mask.url
             , class "w-full aspect-square object-contain bg-gray-100"
             , style "filter"
-                (case selectedIndex of
-                    Just i ->
-                        maskColorFilter i
+                (if isSelected then
+                    maskColorFilter currentLabel
 
-                    Nothing ->
-                        "none"
+                 else
+                    "none"
                 )
             ]
             []
@@ -1117,15 +1286,21 @@ viewMaskThumbnail model idx mask =
             ]
         , if isSelected then
             div [ class "absolute top-1 right-1" ]
-                [ input
-                    [ type_ "number"
-                    , Html.Attributes.min "1"
-                    , value (String.fromInt currentLabel)
-                    , onInput (SetMaskLabel mask.maskId)
-                    , stopPropagationOn "click" (D.succeed ( SetMaskLabel mask.maskId (String.fromInt currentLabel), True ))
-                    , class "w-8 h-6 text-xs text-center border rounded"
+                [ select
+                    [ onInput (SetMaskLabel mask.maskId)
+                    , stopPropagationOn "click" (D.succeed ( SetMaskLabel mask.maskId (indexToLetter currentLabel), True ))
+                    , class "w-10 h-6 text-xs text-center border rounded bg-white"
                     ]
-                    []
+                    (List.map
+                        (\i ->
+                            option
+                                [ value (indexToLetter i)
+                                , selected (i == currentLabel)
+                                ]
+                                [ text (indexToLetter i) ]
+                        )
+                        (List.range 0 25)
+                    )
                 ]
 
           else

@@ -1,8 +1,17 @@
+"""SST-style inference using SAM2 with batched memory attention.
+
+Efficient approach:
+1. Process all labeled images through ViT + memory encoder ONCE
+2. Build shared memory bank from all labeled frames
+3. For batches of unlabeled images, run ViT + memory attention with shared memory
+"""
+
 import collections
-import collections.abc
-import dataclasses
 import logging
 import pathlib
+import sys
+import time
+from dataclasses import dataclass
 
 import beartype
 import duckdb
@@ -15,47 +24,26 @@ from PIL import Image
 
 import lib
 
-log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
-logging.basicConfig(level=logging.INFO, format=log_format)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger("inference")
 
 
 @beartype.beartype
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True)
 class FrameMeta:
     pk: str
-    """Primary key."""
-    group: tuple[collections.abc.Hashable, ...]
-    """Group for this frame."""
+    group: tuple
     img_fpath: pathlib.Path
     original_size: tuple[int, int]
 
 
 @beartype.beartype
-@dataclasses.dataclass(frozen=True, slots=True)
-class RefMask:
-    pk: str
-    mask_fpath: pathlib.Path
-    obj_ids: tuple[int, ...]  # stable global ids across the video
-
-
-@beartype.beartype
-def _pad(x: int, multiple: int) -> int:
-    return ((x + multiple - 1) // multiple) * multiple
-
-
-@beartype.beartype
-def get_target_size(
-    sizes_wh: list[tuple[int, int]], *, multiple: int = 16
-) -> tuple[int, int]:
-    # Uniform target size as ceil(max W/H) to `multiple` (SAM2 usually likes multiples of 16/32)
-    w = max(w for (w, h) in sizes_wh)
-    h = max(h for (w, h) in sizes_wh)
-    return _pad(w, multiple), _pad(h, multiple)
-
-
-@beartype.beartype
 def get_frames(spec: lib.Spec) -> list[FrameMeta]:
+    """Load and filter frames from master CSV based on spec."""
     master_df = pl.read_csv(spec.master_csv, infer_schema_length=None)
     conn = duckdb.connect()
     conn.register("master_df", master_df)
@@ -64,15 +52,6 @@ def get_frames(spec: lib.Spec) -> list[FrameMeta]:
     if spec.primary_key not in filtered_df.columns:
         logger.error(
             "Primary key column '%s' not found in filtered dataset", spec.primary_key
-        )
-        return []
-
-    dup = filtered_df.group_by(spec.primary_key).agg(pl.len()).filter(pl.col("len") > 1)
-    if len(dup) > 0:
-        logger.error(
-            "Primary key '%s' is not unique! Found %d duplicates.",
-            spec.primary_key,
-            len(dup),
         )
         return []
 
@@ -98,184 +77,400 @@ def get_frames(spec: lib.Spec) -> list[FrameMeta]:
 
 
 @beartype.beartype
-def get_ref_masks(spec: lib.Spec, pks: set[str]) -> list[RefMask]:
-    ref_masks: list[RefMask] = []
-    for pk in pks:
-        mask_fpath = spec.ref_masks / f"{pk}.png"
-        if not mask_fpath.exists():
-            continue
-        with Image.open(mask_fpath) as m:
-            hw = np.array(m, dtype=np.uint8)
-        obj_ids = tuple(int(x) for x in np.unique(hw) if x > 0)
-        if not obj_ids:
-            continue
-        ref_masks.append(RefMask(pk, mask_fpath, obj_ids))
+def get_ref_masks(spec: lib.Spec, group_pks: set[str]) -> dict[str, np.ndarray]:
+    """Load reference masks for a group. Returns dict of pk -> mask array."""
+    ref_masks: dict[str, np.ndarray] = {}
+    for mask_fpath in spec.ref_masks.glob("*.png"):
+        pk = mask_fpath.stem
+        if pk in group_pks:
+            with Image.open(mask_fpath) as m:
+                mask = np.array(m, dtype=np.uint8)
+            # Get unique object IDs (excluding background 0)
+            obj_ids = [int(x) for x in np.unique(mask) if x > 0]
+            if obj_ids:
+                ref_masks[pk] = mask
     return ref_masks
 
 
-@beartype.beartype
-class FrameDataset:
-    def __init__(self, frames: list[FrameMeta], tgt_wh: tuple[int, int]):
+class ImageDataset(torch.utils.data.Dataset):
+    """Dataset for parallel image loading."""
+
+    def __init__(self, frames: list[FrameMeta], processor):
         self.frames = frames
-        self.tgt_wh = tgt_wh
+        self.processor = processor
 
-    def __getitem__(self, i: int) -> tuple[Image.Image, FrameMeta]:
-        with Image.open(self.frames[i].img_fpath) as img:
-            img = img.convert("RGB").resize(self.tgt_wh, Image.Resampling.LANCZOS)
-
-        return img, self.frames[i]
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.frames)
 
+    def __getitem__(self, idx):
+        frame = self.frames[idx]
+        with Image.open(frame.img_fpath) as img:
+            img = img.convert("RGB")
+        # Process single image - returns [1, 1, C, H, W]
+        processed = self.processor.video_processor(
+            videos=[img], device="cpu", return_tensors="pt"
+        )
+        # Return [C, H, W] and pk
+        return processed.pixel_values_videos[0, 0], frame.pk
+
 
 @beartype.beartype
-def get_dataloader(
-    spec: lib.Spec, frames: list[FrameMeta], group: tuple, *, batch_size: int
-) -> torch.utils.data.DataLoader:
-    tgt_w, tgt_h = get_target_size([f.original_size for f in frames], multiple=16)
+def precompute_vision_features(
+    model: transformers.Sam2VideoModel,
+    processor: transformers.Sam2VideoProcessor,
+    frames: list[FrameMeta],
+    device: str,
+    batch_size: int = 32,
+    num_workers: int = 8,
+) -> dict[str, dict]:
+    """Pre-compute vision features for all frames using batched inference.
 
-    pks = set(f.pk for f in frames)
-    ref_masks = get_ref_masks(spec, pks)
-    ref_pks = set(mask.pk for mask in ref_masks)
-
-    ref_frame_lookup = {frame.pk: frame for frame in frames if frame.pk in ref_pks}
-    pred_frames = [frame for frame in frames if frame.pk not in ref_pks]
-
-    obj_ids = set()
-    for ref_mask in ref_masks:
-        obj_ids.update(ref_mask.obj_ids)
-    obj_ids = sorted(obj_ids)
-
-    ref_dataset, input_masks = [], []
-    for mask in sorted(ref_masks, key=lambda mask: mask.obj_ids, reverse=True):
-        ref_frame = ref_frame_lookup[mask.pk]
-        with Image.open(ref_frame.img_fpath) as img:
-            ref_dataset.append((img.resize((tgt_w, tgt_h)), ref_frame))
-
-        with Image.open(mask.mask_fpath) as img:
-            mask_hw = np.array(
-                img.resize((tgt_w, tgt_h), Image.Resampling.NEAREST), dtype=np.uint8
-            )
-
-        mask_hw_list = [torch.zeros((tgt_h, tgt_w), dtype=torch.float32)] * len(obj_ids)
-        for i, obj_id in enumerate(obj_ids):
-            m = (mask_hw == obj_id).astype(np.float32)
-            mask_hw_list[i] = torch.from_numpy(m)
-
-        input_masks.append(mask_hw_list)
-
-    def _collate_fn(batch):
-        mask_i = np.linspace(0, batch_size - 1, len(input_masks), dtype=int).tolist()
-
-        with_ref = []
-        start = 0
-        for i, end in enumerate(mask_i):
-            with_ref.extend(batch[start:end])
-            with_ref.append(ref_dataset[i])
-            start = end
-
-        assert len(with_ref) <= batch_size
-        imgs, frames = zip(*with_ref)
-
-        return {
-            "imgs": imgs,
-            "frames": frames,
-            "mask_i": mask_i,
-            "masks": input_masks,
-            "obj_ids": list(obj_ids),
-        }
-
-    return torch.utils.data.DataLoader(
-        FrameDataset(pred_frames, (tgt_w, tgt_h)),
-        num_workers=8,
-        collate_fn=_collate_fn,
-        batch_size=batch_size - len(ref_masks),
+    Returns a dict mapping pk -> {"vision_feats": ..., "vision_pos_embeds": ...}
+    """
+    logger.info(
+        "Pre-computing vision features for %d frames (batch_size=%d, num_workers=%d)...",
+        len(frames),
+        batch_size,
+        num_workers,
     )
 
+    features_cache: dict[str, dict] = {}
+
+    # Use DataLoader for parallel image loading
+    dataset = ImageDataset(frames, processor)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+
+    processed_count = 0
+    for pixel_values, pks in dataloader:
+        # pixel_values: [batch, C, H, W], pks: list of primary keys
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            pv_batch = pixel_values.to(device, dtype=torch.bfloat16)
+            vision_feats, vision_pos_embeds, _, _ = model.get_image_features(pv_batch)
+
+            # Store each frame's features on CPU
+            # Features have shape [HW, batch, C] - batch is middle dimension
+            for j, pk in enumerate(pks):
+                features_cache[pk] = {
+                    "vision_feats": [f[:, j : j + 1, :].cpu() for f in vision_feats],
+                    "vision_pos_embeds": [
+                        p[:, j : j + 1, :].cpu() for p in vision_pos_embeds
+                    ],
+                }
+
+        processed_count += len(pks)
+        if processed_count % (batch_size * 10) == 0 or processed_count >= len(frames):
+            logger.info("  Processed %d/%d frames", processed_count, len(frames))
+
+    return features_cache
+
 
 @beartype.beartype
-def main(spec: pathlib.Path, /):
-    spec = lib.Spec.model_validate_json(spec.read_text())
+def predict_with_session(
+    model: transformers.Sam2VideoModel,
+    processor: transformers.Sam2VideoProcessor,
+    target_frames: list[FrameMeta],
+    ref_frames: list[FrameMeta],
+    ref_masks: dict[str, np.ndarray],
+    features_cache: dict[str, dict],
+    device: str,
+    target_size: tuple[int, int],
+) -> list[np.ndarray]:
+    """Predict masks for target frames by reusing a single session's memory.
+
+    This builds a session with ref frames, runs them once to populate memory,
+    then predicts each target frame using that shared memory.
+    """
+    # Get all object IDs from reference masks
+    all_obj_ids = set()
+    for ref_frame in ref_frames:
+        mask = ref_masks[ref_frame.pk]
+        obj_ids = [int(x) for x in np.unique(mask) if x > 0]
+        all_obj_ids.update(obj_ids)
+    all_obj_ids = sorted(all_obj_ids)
+
+    if not all_obj_ids:
+        return [np.zeros((64, 64), dtype=np.uint8) for _ in target_frames]
+
+    # Load reference images
+    ref_images = []
+    for f in ref_frames:
+        with Image.open(f.img_fpath) as img:
+            ref_img = img.convert("RGB")
+            if ref_img.size != target_size:
+                ref_img = ref_img.resize(target_size, Image.Resampling.LANCZOS)
+            ref_images.append(ref_img)
+
+    # Create session with ref frames + one placeholder for target
+    # We'll swap out the target frame for each prediction
+    dummy_target = ref_images[0]  # Use first ref as placeholder
+    session_images = ref_images + [dummy_target]
+
+    session = processor.init_video_session(
+        video=session_images,
+        inference_device=device,
+        dtype=torch.bfloat16,
+        max_vision_features_cache_size=len(session_images),
+    )
+
+    # Inject cached features for ref frames
+    for frame_idx, frame in enumerate(ref_frames):
+        if frame.pk in features_cache:
+            inject_cached_features(session, frame_idx, features_cache[frame.pk], device)
+
+    # Add mask inputs on reference frames
+    n_refs = len(ref_frames)
+    for frame_idx, ref_frame in enumerate(ref_frames):
+        mask = ref_masks[ref_frame.pk]
+        mask_h, mask_w = mask.shape
+        if (mask_w, mask_h) != target_size:
+            mask_img = Image.fromarray(mask)
+            mask_img = mask_img.resize(target_size, Image.Resampling.NEAREST)
+            mask = np.array(mask_img)
+        masks_for_objs = []
+        for obj_id in all_obj_ids:
+            obj_mask = (mask == obj_id).astype(np.float32)
+            masks_for_objs.append(torch.from_numpy(obj_mask))
+        processor.add_inputs_to_inference_session(
+            inference_session=session,
+            frame_idx=frame_idx,
+            obj_ids=list(
+                all_obj_ids
+            ),  # Pass a copy - processor clears this list internally
+            input_masks=masks_for_objs,
+        )
+
+    # Run forward on reference frames to establish conditioning
+    logger.info("Running forward on %d reference frames to build memory...", n_refs)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for frame_idx in range(n_refs):
+            model(inference_session=session, frame_idx=frame_idx)
+
+    # Now predict each target frame
+    results = []
+    for target_frame in target_frames:
+        # Inject target's vision features
+        if target_frame.pk in features_cache:
+            inject_cached_features(
+                session, n_refs, features_cache[target_frame.pk], device
+            )
+
+        # Clear any previous non-cond output at this frame index
+        for obj_idx in range(len(all_obj_ids)):
+            if n_refs in session.output_dict_per_obj[obj_idx]["non_cond_frame_outputs"]:
+                del session.output_dict_per_obj[obj_idx]["non_cond_frame_outputs"][
+                    n_refs
+                ]
+
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            output = model(inference_session=session, frame_idx=n_refs)
+
+        # Post-process mask
+        pred_masks = processor.post_process_masks(
+            [output.pred_masks],
+            original_sizes=[[session.video_height, session.video_width]],
+            binarize=True,
+        )[0]
+
+        # Combine masks into single channel
+        n_obj, _, h, w = pred_masks.shape
+        combined_mask = torch.zeros((h, w), dtype=torch.uint8, device=pred_masks.device)
+        for obj_idx, obj_id in enumerate(all_obj_ids):
+            # pred_masks is boolean after binarize=True, use directly as index
+            combined_mask[pred_masks[obj_idx, 0]] = obj_id
+
+        results.append(combined_mask.cpu().numpy())
+
+    return results
+
+
+@beartype.beartype
+def inject_cached_features(
+    session,
+    frame_idx: int,
+    cached: dict,
+    device: str,
+):
+    """Inject pre-computed vision features into session cache."""
+    vision_feats = cached["vision_feats"]
+    vision_pos_embeds = cached["vision_pos_embeds"]
+
+    session.cache._vision_features[frame_idx] = {
+        "vision_feats": [f.to(device) for f in vision_feats],
+        "vision_pos_embeds": [p.to(device) for p in vision_pos_embeds],
+    }
+
+
+@beartype.beartype
+def main(
+    spec_fpath: pathlib.Path, /, batch_size: int = 16, max_frames: int | None = None
+):
+    """Run batched SAM2 inference with shared memory bank.
+
+    Args:
+        spec_fpath: Path to spec JSON file
+        batch_size: Batch size for inference (number of target frames per batch)
+        max_frames: Maximum number of frames per group (for debugging). If None, process all.
+    """
+    spec = lib.Spec.model_validate_json(spec_fpath.read_text())
     spec.pred_masks.mkdir(parents=True, exist_ok=True)
 
     frames = get_frames(spec)
+    logger.info("Loaded %d frames", len(frames))
     if not frames:
+        logger.error("No frames found")
         return
 
-    frame_groups = collections.defaultdict(list)
+    # Group frames
+    frame_groups: dict[tuple, list[FrameMeta]] = collections.defaultdict(list)
     for frame in frames:
         frame_groups[frame.group].append(frame)
 
-    # Check all groups have at least 2 reference masks before starting any inference
-    groups_with_insufficient_refs = []
+    # Filter to groups with reference masks
+    # group_key (columns) -> (list of frames, reference masks [pk -> mask array])
+    groups_to_process: dict[tuple, tuple[list[FrameMeta], dict[str, np.ndarray]]] = {}
     for group, group_frames in frame_groups.items():
-        ref_masks = get_ref_masks(spec, set(f.pk for f in group_frames))
-        if len(ref_masks) < 2:
-            groups_with_insufficient_refs.append((group, len(ref_masks)))
+        group_pks = set(f.pk for f in group_frames)
+        ref_masks = get_ref_masks(spec, group_pks)
+        if len(ref_masks) >= 1:
+            # Limit frames per group for debugging (keeping all reference frames)
+            if max_frames is not None and len(group_frames) > max_frames:
+                ref_pks = set(ref_masks.keys())
+                ref_frames_list = [f for f in group_frames if f.pk in ref_pks]
+                other_frames = [f for f in group_frames if f.pk not in ref_pks]
+                n_other = max(0, max_frames - len(ref_frames_list))
+                group_frames = ref_frames_list + other_frames[:n_other]
+                logger.info(
+                    "Group %s limited to %d frames (%d refs + %d targets)",
+                    group,
+                    len(group_frames),
+                    len(ref_frames_list),
+                    n_other,
+                )
+            groups_to_process[group] = (group_frames, ref_masks)
+        elif len(ref_masks) > 0:
+            logger.warning("Skipping group %s: no reference masks.", group)
 
-    if groups_with_insufficient_refs:
-        for group, ref_count in groups_with_insufficient_refs:
-            logger.error("Group %s has %d reference mask(s).", group, ref_count)
+    if not groups_to_process:
+        logger.error("No groups have reference masks. Cannot proceed.")
         return
 
+    logger.info("Processing %d groups with reference masks.", len(groups_to_process))
+
+    # Load model
+    logger.info("Loading model: %s", spec.sam2)
     model = transformers.Sam2VideoModel.from_pretrained(spec.sam2).to(
         spec.device, dtype=torch.bfloat16
     )
     processor = transformers.Sam2VideoProcessor.from_pretrained(spec.sam2)
+    model.eval()
 
-    for group, frames in frame_groups.items():
-        logger.info("Processing group %s with %d frames", group, len(frames))
-        dataloader = get_dataloader(spec, frames, group, batch_size=32)
-        logger.info("Got dataloader with %d batches.", len(dataloader))
+    # Count total targets
+    total_targets = sum(
+        len(group_frames) - len(ref_masks)
+        for group_frames, ref_masks in groups_to_process.values()
+    )
+    total_processed = 0
+    start_time = time.time()
 
-        for batch in lib.progress(dataloader):
-            assert len(batch["mask_i"]) == len(batch["masks"])
-            session = processor.init_video_session(
-                video=batch["imgs"],
-                inference_device=spec.device,
-                dtype=torch.bfloat16,
+    # Process each group
+    for group, (group_frames, ref_masks) in groups_to_process.items():
+        ref_pks = set(ref_masks.keys())
+        ref_frames = [f for f in group_frames if f.pk in ref_pks]
+        target_frames = [f for f in group_frames if f.pk not in ref_pks]
+
+        # Filter out already processed targets
+        targets_to_process = []
+        for tf in target_frames:
+            out_fpath = spec.pred_masks / f"{tf.pk}.png"
+            if not out_fpath.exists():
+                targets_to_process.append(tf)
+            else:
+                total_processed += 1
+
+        if not targets_to_process:
+            logger.info("Group %s: all targets already processed, skipping.", group)
+            continue
+
+        logger.info(
+            "Processing group %s: %d ref frames, %d targets to process",
+            group,
+            len(ref_frames),
+            len(targets_to_process),
+        )
+
+        # Get a common target size (use first target's size)
+        target_size = targets_to_process[0].original_size
+
+        # Pre-compute vision features for ref frames and targets
+        all_frames_for_group = ref_frames + targets_to_process
+        features_cache = precompute_vision_features(
+            model, processor, all_frames_for_group, spec.device, batch_size=32
+        )
+
+        # Process targets using session-based approach
+        # This builds the session once with ref frames, then reuses memory for all targets
+        try:
+            pred_masks = predict_with_session(
+                model,
+                processor,
+                targets_to_process,
+                ref_frames,
+                ref_masks,
+                features_cache,
+                spec.device,
+                target_size,
             )
-            orig_size = [session.video_height, session.video_width]
 
-            for frame_idx, input_masks in zip(batch["mask_i"], batch["masks"]):
-                processor.add_inputs_to_inference_session(
-                    inference_session=session,
-                    frame_idx=frame_idx,
-                    obj_ids=batch["obj_ids"],
-                    input_masks=input_masks,
-                )
-
-            for output in model.propagate_in_video_iterator(session, start_frame_idx=0):
-                # The output of post_process_masks is a list with one element.
-                masks_o1hw = processor.post_process_masks(
-                    [output.pred_masks], original_sizes=[orig_size], binarize=True
-                )[0]
-
-                n_obj, singleton, h, w = masks_o1hw.shape
-                assert singleton == 1, str(masks_o1hw.shape)
-
-                # Create single channel mask with object IDs
-                # Shape: (n_objects, height, width) -> (height, width)
-                combined_mask = torch.zeros(
-                    (h, w), dtype=torch.uint8, device=masks_o1hw.device
-                )
-                for obj_idx, mask in enumerate(masks_o1hw[:, 0, :, :]):
-                    # Use obj_idx + 1 to reserve 0 for background
-                    combined_mask[mask > 0] = obj_idx + 1
-
-                # Convert to PIL image
-                mask_img = Image.fromarray(combined_mask.cpu().numpy())
-
-                # Resize mask back to original frame dimensions if needed
-                frame = batch["frames"][output.frame_idx]
+            # Save each mask
+            for target_frame, pred_mask in zip(targets_to_process, pred_masks):
+                out_fpath = spec.pred_masks / f"{target_frame.pk}.png"
+                mask_img = Image.fromarray(pred_mask)
                 mask_img = mask_img.resize(
-                    frame.original_size, Image.Resampling.NEAREST
+                    target_frame.original_size, Image.Resampling.NEAREST
                 )
+                mask_img.save(out_fpath)
+                total_processed += 1
 
-                # Use primary key for filename
-                mask_fname = f"{frame.pk}.png"
-                mask_img.save(spec.pred_masks / mask_fname)
+                # Progress logging every 100 frames
+                if total_processed % 100 == 0 or total_processed == total_targets:
+                    elapsed = time.time() - start_time
+                    rate = total_processed / elapsed if elapsed > 0 else 0
+                    eta = (total_targets - total_processed) / rate if rate > 0 else 0
+                    logger.info(
+                        "Progress: %d/%d (%.1f%%) | %.2f frames/sec | ETA: %.1f min",
+                        total_processed,
+                        total_targets,
+                        100 * total_processed / total_targets
+                        if total_targets > 0
+                        else 100,
+                        rate,
+                        eta / 60,
+                    )
+
+        except Exception as e:
+            import traceback
+
+            logger.error(
+                "Error processing group %s: %s\n%s", group, e, traceback.format_exc()
+            )
+            continue
+
+        # Clear cache to free memory
+        del features_cache
+
+    elapsed = time.time() - start_time
+    logger.info(
+        "Done! Processed %d frames in %.1f seconds (%.2f frames/sec)",
+        total_processed,
+        elapsed,
+        total_processed / elapsed if elapsed > 0 else 0,
+    )
 
 
 if __name__ == "__main__":
