@@ -1141,12 +1141,20 @@ viewMasksPage model =
                                                                         Dict.get maskId model.selectedMasks |> Maybe.withDefault 0
                                                                 in
                                                                 Just
-                                                                    (img
-                                                                        [ src mask.url
-                                                                        , class "absolute top-0 left-0 w-full h-full object-contain pointer-events-none"
-                                                                        , style "opacity" "0.8"
-                                                                        , style "filter" (maskColorFilter label)
-                                                                        , style "mix-blend-mode" "screen"
+                                                                    (div
+                                                                        [ class "absolute top-0 left-0 w-full h-full pointer-events-none"
+                                                                        , style "background-color" (maskColor (label + 1))
+                                                                        , style "opacity" "0.5"
+                                                                        , style "-webkit-mask-image" ("url(" ++ mask.url ++ ")")
+                                                                        , style "mask-image" ("url(" ++ mask.url ++ ")")
+                                                                        , style "-webkit-mask-mode" "luminance"
+                                                                        , style "mask-mode" "luminance"
+                                                                        , style "-webkit-mask-size" "contain"
+                                                                        , style "mask-size" "contain"
+                                                                        , style "-webkit-mask-repeat" "no-repeat"
+                                                                        , style "mask-repeat" "no-repeat"
+                                                                        , style "-webkit-mask-position" "center"
+                                                                        , style "mask-position" "center"
                                                                         ]
                                                                         []
                                                                     )
@@ -1229,17 +1237,27 @@ letterToIndex str =
         Nothing
 
 
-maskColorFilter : Int -> String
-maskColorFilter maskId =
+maskColor : Int -> String
+maskColor maskId =
     let
-        -- Hue rotation values for distinct colors: orange, blue, green, pink, purple, etc.
-        hueRotations =
-            [ 0, 180, 90, 300, 270, 45, 135, 225, 315, 30 ]
+        -- RGB colors matching mask_browser.py:
+        -- 1=red, 2=green, 3=blue, 4=yellow, 5=magenta, 6=cyan, 7=orange, 8=purple, 9=spring green
+        colors =
+            [ "rgb(255, 0, 0)" -- 1: red
+            , "rgb(0, 255, 0)" -- 2: green
+            , "rgb(0, 0, 255)" -- 3: blue
+            , "rgb(255, 255, 0)" -- 4: yellow
+            , "rgb(255, 0, 255)" -- 5: magenta
+            , "rgb(0, 255, 255)" -- 6: cyan
+            , "rgb(255, 128, 0)" -- 7: orange
+            , "rgb(128, 0, 255)" -- 8: purple
+            , "rgb(0, 255, 128)" -- 9: spring green
+            ]
 
-        hue =
-            Maybe.withDefault 0 (List.head (List.drop (modBy 10 maskId) hueRotations))
+        colorValue =
+            Maybe.withDefault "rgb(255, 0, 0)" (List.head (List.drop (modBy 9 (maskId - 1)) colors))
     in
-    "sepia(1) saturate(20) brightness(1.5) hue-rotate(" ++ String.fromInt hue ++ "deg)"
+    colorValue
 
 
 viewMaskThumbnail : Model -> Int -> MaskMeta -> Html Msg
@@ -1263,18 +1281,29 @@ viewMaskThumbnail model idx mask =
             )
         , onClick (ToggleMask mask.maskId)
         ]
-        [ img
-            [ src mask.url
-            , class "w-full aspect-square object-contain bg-gray-100"
-            , style "filter"
+        [ div
+            [ class "w-full aspect-square relative"
+            , style "background-color"
                 (if isSelected then
-                    maskColorFilter currentLabel
+                    maskColor (currentLabel + 1)
 
                  else
-                    "none"
+                    "#111827"
                 )
             ]
-            []
+            [ img
+                [ src mask.url
+                , class "w-full h-full object-contain"
+                , style "mix-blend-mode"
+                    (if isSelected then
+                        "multiply"
+
+                     else
+                        "normal"
+                    )
+                ]
+                []
+            ]
         , div [ class "absolute bottom-0 left-0 right-0 bg-black bg-opacity-60 text-white text-xs p-1 flex justify-between items-center" ]
             [ span [] [ text (String.fromInt mask.maskId) ]
             , case mask.score of
