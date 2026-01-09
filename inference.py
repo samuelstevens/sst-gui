@@ -4,14 +4,22 @@ Efficient approach:
 1. Process all labeled images through ViT + memory encoder ONCE
 2. Build shared memory bank from all labeled frames
 3. For batches of unlabeled images, run ViT + memory attention with shared memory
+
+Valid SAM2 model names (HuggingFace):
+
+- facebook/sam2.1-hiera-tiny
+- facebook/sam2.1-hiera-small
+- facebook/sam2.1-hiera-base-plus
+- facebook/sam2.1-hiera-large
 """
 
 import collections
 import logging
 import pathlib
+import random
 import sys
 import time
-from dataclasses import dataclass
+import dataclasses
 
 import beartype
 import duckdb
@@ -33,7 +41,7 @@ logger = logging.getLogger("inference")
 
 
 @beartype.beartype
-@dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FrameMeta:
     pk: str
     group: tuple
@@ -278,10 +286,12 @@ def predict_with_session(
         )[0]
 
         # Combine masks into single channel
+        # Use session.obj_idx_to_id to get correct ID for each output index
+        # (model may reorder objects internally)
         n_obj, _, h, w = pred_masks.shape
         combined_mask = torch.zeros((h, w), dtype=torch.uint8, device=pred_masks.device)
-        for obj_idx, obj_id in enumerate(all_obj_ids):
-            # pred_masks is boolean after binarize=True, use directly as index
+        for obj_idx in range(n_obj):
+            obj_id = session.obj_idx_to_id(obj_idx)
             combined_mask[pred_masks[obj_idx, 0]] = obj_id
 
         results.append(combined_mask.cpu().numpy())
@@ -407,62 +417,92 @@ def main(
         # Get a common target size (use first target's size)
         target_size = targets_to_process[0].original_size
 
-        # Pre-compute vision features for ref frames and targets
-        all_frames_for_group = ref_frames + targets_to_process
-        features_cache = precompute_vision_features(
-            model, processor, all_frames_for_group, spec.device, batch_size=32
+        # Pre-compute vision features for ref frames first (always needed)
+        ref_features_cache = precompute_vision_features(
+            model, processor, ref_frames, spec.device, batch_size=32
         )
 
-        # Process targets using session-based approach
-        # This builds the session once with ref frames, then reuses memory for all targets
-        try:
-            pred_masks = predict_with_session(
-                model,
-                processor,
-                targets_to_process,
-                ref_frames,
-                ref_masks,
-                features_cache,
-                spec.device,
-                target_size,
+        # Process targets in batches to avoid OOM
+        vision_batch_size = 2048
+        for batch_start in range(0, len(targets_to_process), vision_batch_size):
+            batch_end = min(batch_start + vision_batch_size, len(targets_to_process))
+            batch_targets = targets_to_process[batch_start:batch_end]
+
+            logger.info(
+                "Processing batch %d-%d of %d targets",
+                batch_start,
+                batch_end,
+                len(targets_to_process),
             )
 
-            # Save each mask
-            for target_frame, pred_mask in zip(targets_to_process, pred_masks):
-                out_fpath = spec.pred_masks / f"{target_frame.pk}.png"
-                mask_img = Image.fromarray(pred_mask)
-                mask_img = mask_img.resize(
-                    target_frame.original_size, Image.Resampling.NEAREST
+            # Pre-compute vision features for this batch of targets
+            batch_features_cache = precompute_vision_features(
+                model, processor, batch_targets, spec.device, batch_size=32
+            )
+
+            # Combine ref features with batch features
+            features_cache = {**ref_features_cache, **batch_features_cache}
+
+            # Process targets using session-based approach
+            try:
+                pred_masks = predict_with_session(
+                    model,
+                    processor,
+                    batch_targets,
+                    ref_frames,
+                    ref_masks,
+                    features_cache,
+                    spec.device,
+                    target_size,
                 )
-                mask_img.save(out_fpath)
-                total_processed += 1
 
-                # Progress logging every 100 frames
-                if total_processed % 100 == 0 or total_processed == total_targets:
-                    elapsed = time.time() - start_time
-                    rate = total_processed / elapsed if elapsed > 0 else 0
-                    eta = (total_targets - total_processed) / rate if rate > 0 else 0
-                    logger.info(
-                        "Progress: %d/%d (%.1f%%) | %.2f frames/sec | ETA: %.1f min",
-                        total_processed,
-                        total_targets,
-                        100 * total_processed / total_targets
-                        if total_targets > 0
-                        else 100,
-                        rate,
-                        eta / 60,
+                # Save each mask
+                for target_frame, pred_mask in zip(batch_targets, pred_masks):
+                    out_fpath = spec.pred_masks / f"{target_frame.pk}.png"
+                    mask_img = Image.fromarray(pred_mask)
+                    mask_img = mask_img.resize(
+                        target_frame.original_size, Image.Resampling.NEAREST
                     )
+                    mask_img.save(out_fpath)
+                    total_processed += 1
 
-        except Exception as e:
-            import traceback
+                    # Progress logging every 100 frames
+                    if total_processed % 100 == 0 or total_processed == total_targets:
+                        elapsed = time.time() - start_time
+                        rate = total_processed / elapsed if elapsed > 0 else 0
+                        eta = (
+                            (total_targets - total_processed) / rate if rate > 0 else 0
+                        )
+                        logger.info(
+                            "Progress: %d/%d (%.1f%%) | %.2f frames/sec | ETA: %.1f min",
+                            total_processed,
+                            total_targets,
+                            100 * total_processed / total_targets
+                            if total_targets > 0
+                            else 100,
+                            rate,
+                            eta / 60,
+                        )
 
-            logger.error(
-                "Error processing group %s: %s\n%s", group, e, traceback.format_exc()
-            )
-            continue
+            except Exception as e:
+                import traceback
 
-        # Clear cache to free memory
-        del features_cache
+                logger.error(
+                    "Error processing group %s batch %d-%d: %s\n%s",
+                    group,
+                    batch_start,
+                    batch_end,
+                    e,
+                    traceback.format_exc(),
+                )
+                continue
+
+            # Clear batch cache to free memory
+            del batch_features_cache
+            del features_cache
+
+        # Clear ref features cache
+        del ref_features_cache
 
     elapsed = time.time() - start_time
     logger.info(
