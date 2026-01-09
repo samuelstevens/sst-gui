@@ -1,9 +1,11 @@
 import base64
 import functools
 import io
+import logging
 import pathlib
 import random
 import threading
+import traceback
 import uuid
 from dataclasses import dataclass, field
 
@@ -16,9 +18,15 @@ from litestar import Litestar, Request, Response, get, post
 from litestar.datastructures import UploadFile
 from litestar.exceptions import HTTPException
 from litestar.static_files import create_static_files_router
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 from transformers import pipeline
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 class ProjectConfig(BaseModel):
@@ -117,6 +125,9 @@ def load_sam2_pipeline(model_name: str, device: str):
     )
 
 
+MAX_IMAGE_DIMENSION = 2048  # Resize images larger than this to avoid OOM
+
+
 @beartype.beartype
 def generate_masks_sync(
     sam2_model: str, device: str, img_fpath: pathlib.Path, scale: float
@@ -125,28 +136,66 @@ def generate_masks_sync(
 
     Returns (full_masks, preview_pngs, scores, areas).
     """
+    # Clear GPU cache before inference to avoid OOM from accumulated memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     generator = load_sam2_pipeline(sam2_model, device)
 
     with Image.open(img_fpath) as img:
+        img = ImageOps.exif_transpose(img)  # Apply EXIF rotation
         img = img.convert("RGB")
         orig_w, orig_h = img.size
-        outputs = generator(img, points_per_batch=256)
+
+    # Resize if image is too large to avoid OOM during mask upsampling
+    inference_scale = 1.0
+    if max(orig_w, orig_h) > MAX_IMAGE_DIMENSION:
+        inference_scale = MAX_IMAGE_DIMENSION / max(orig_w, orig_h)
+        infer_w = int(orig_w * inference_scale)
+        infer_h = int(orig_h * inference_scale)
+        with Image.open(img_fpath) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB").resize(
+                (infer_w, infer_h), Image.Resampling.LANCZOS
+            )
+            outputs = generator(img, points_per_batch=256)
+        logger.info(
+            "Resized image from %dx%d to %dx%d for inference",
+            orig_w,
+            orig_h,
+            infer_w,
+            infer_h,
+        )
+    else:
+        with Image.open(img_fpath) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            outputs = generator(img, points_per_batch=256)
 
     full_masks: list[np.ndarray] = []
     preview_pngs: list[bytes] = []
     scores: list[float] = []
     areas: list[int] = []
 
-    new_w = max(1, int(orig_w * scale))
-    new_h = max(1, int(orig_h * scale))
+    preview_w = max(1, int(orig_w * scale))
+    preview_h = max(1, int(orig_h * scale))
 
     for item in outputs["masks"]:
         mask_arr = np.array(item, dtype=np.uint8)
+
+        # If we resized the image for inference, upscale mask back to original size
+        if inference_scale < 1.0:
+            mask_img = Image.fromarray(mask_arr * 255)
+            mask_img = mask_img.resize((orig_w, orig_h), Image.Resampling.NEAREST)
+            mask_arr = (np.array(mask_img) > 127).astype(np.uint8)
+
         full_masks.append(mask_arr)
         scores.append(float(item.get("score", 0.0)) if hasattr(item, "get") else 0.0)
         areas.append(int(mask_arr.sum()))
+
+        # Create preview at requested scale
         mask_img = Image.fromarray(mask_arr * 255)
-        mask_scaled = mask_img.resize((new_w, new_h), Image.Resampling.NEAREST)
+        mask_scaled = mask_img.resize((preview_w, preview_h), Image.Resampling.NEAREST)
         buf = io.BytesIO()
         mask_scaled.save(buf, format="PNG")
         preview_pngs.append(buf.getvalue())
@@ -397,6 +446,7 @@ async def get_frame_image(project_id: str, pk: str, scale: float = 0.25) -> Resp
         raise HTTPException(status_code=404, detail="image not found")
 
     with Image.open(img_fpath) as img:
+        img = ImageOps.exif_transpose(img)  # Apply EXIF rotation
         img = img.convert("RGB")
         w, h = img.size
         img = img.resize(
@@ -567,6 +617,24 @@ async def index() -> Response:
     return Response(content=index_fpath.read_bytes(), media_type="text/html")
 
 
+def internal_server_error_handler(request: Request, exc: Exception) -> Response:
+    """Log full traceback for internal server errors."""
+    # For HTTPExceptions, return appropriate response without logging as error
+    if isinstance(exc, HTTPException):
+        return Response(
+            content={"error": exc.detail},
+            status_code=exc.status_code,
+        )
+    tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(
+        "Internal server error on %s %s:\n%s", request.method, request.url.path, tb_str
+    )
+    return Response(
+        content={"error": "Internal server error", "detail": str(exc)},
+        status_code=500,
+    )
+
+
 def create_app() -> Litestar:
     dist_router = create_static_files_router(
         path="/dist",
@@ -592,6 +660,7 @@ def create_app() -> Litestar:
             dist_router,
         ],
         request_max_body_size=100 * 1024 * 1024,  # 100MB
+        exception_handlers={Exception: internal_server_error_handler},
     )
 
 

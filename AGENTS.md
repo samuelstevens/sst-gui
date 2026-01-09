@@ -9,6 +9,10 @@
 - Variables referring to a absolute filepath should be suffixed with `_fpath`. Filenames are `_fname`. Directories are `_dpath`.
 - submitit and jaxtyping don't work in the same file. See [this issue](https://github.com/patrick-kidger/jaxtyping/issues/332). To solve this, all jaxtyped functions/classes need to be in a different file to the submitit launcher script.
 
+# Inference
+
+- `inference.py` has resume logic - it skips masks that already exist in `pred_masks/`. Don't delete pred_masks when restarting; it will continue from where it left off.
+
 # Test Data
 
 - CSV file for testing: `/local/scratch/stevens.994/datasets/cambridge-segmented/master.csv`

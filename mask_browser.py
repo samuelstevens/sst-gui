@@ -34,7 +34,7 @@ def _(pl, root):
 def _(master_df, mo):
     datasets = sorted(master_df["Dataset"].drop_nulls().unique().to_list())
     dataset_dropdown = mo.ui.dropdown(
-        options=["All"] + datasets,
+        options=["All", "(No Dataset)"] + datasets,
         value="All",
         label="Dataset",
     )
@@ -49,28 +49,76 @@ def _(dataset_dropdown, master_df, pl, pred_masks_dir):
 
     if dataset_dropdown.value == "All":
         filtered_df = master_df
+    elif dataset_dropdown.value == "(No Dataset)":
+        filtered_df = master_df.filter(pl.col("Dataset").is_null())
     else:
         filtered_df = master_df.filter(pl.col("Dataset") == dataset_dropdown.value)
 
     filtered_df = filtered_df.with_columns(
-        pl.col("filepath").map_elements(get_img_path, return_dtype=pl.Utf8).alias("img_path")
+        pl.col("filepath")
+        .map_elements(get_img_path, return_dtype=pl.Utf8)
+        .alias("img_path")
     )
 
     frames = []
-    for row in filtered_df.iter_rows(named=True):
-        pk = row["Image_name"]
+    for _row in filtered_df.iter_rows(named=True):
+        pk = _row["Image_name"]
         mask_path = pred_masks_dir / f"{pk}.png"
         if mask_path.exists():
-            frames.append(
-                {
-                    "pk": pk,
-                    "img_path": row["img_path"],
-                    "mask_path": str(mask_path),
-                    "dataset": row["Dataset"],
-                }
-            )
+            frames.append({
+                "pk": pk,
+                "img_path": _row["img_path"],
+                "mask_path": str(mask_path),
+                "dataset": _row["Dataset"],
+            })
 
-    frames_df = pl.DataFrame(frames)
+    all_frames_df = pl.DataFrame(frames)
+    return (all_frames_df,)
+
+
+@app.cell
+def _(mo):
+    n_objects_dropdown = mo.ui.dropdown(
+        options=["All", "1", "2", "3", "4", "5", "6+"],
+        value="All",
+        label="# Objects",
+    )
+    n_objects_dropdown
+    return (n_objects_dropdown,)
+
+
+@app.cell
+def _(Image, all_frames_df, mo, n_objects_dropdown, np, pl):
+    def count_objects(mask_path: str) -> int:
+        """Count non-zero unique values in mask (number of objects)."""
+        with Image.open(mask_path) as m:
+            arr = np.array(m)
+        return len([x for x in np.unique(arr) if x > 0])
+
+    if n_objects_dropdown.value == "All":
+        frames_df = all_frames_df
+    else:
+        # Only count objects when filtering, stop after 32 matches
+        target = (
+            6 if n_objects_dropdown.value == "6+" else int(n_objects_dropdown.value)
+        )
+        is_gte = n_objects_dropdown.value == "6+"
+
+        matching_frames = []
+        with mo.status.progress_bar(
+            total=len(all_frames_df), title="Scanning masks..."
+        ) as bar:
+            for _row in all_frames_df.iter_rows(named=True):
+                n_obj = count_objects(_row["mask_path"])
+                if (is_gte and n_obj >= target) or (not is_gte and n_obj == target):
+                    matching_frames.append({**_row, "n_objects": n_obj})
+                    if len(matching_frames) >= 32:
+                        break
+                bar.update()
+
+        frames_df = pl.DataFrame(matching_frames)
+
+    frames_df
     return (frames_df,)
 
 
@@ -128,8 +176,14 @@ def _(frames_df, mo, pk_search, pl, search_button, set_i):
 
     matches = frames_df.filter(pl.col("pk").str.contains(pk_search.value))
     if len(matches) > 0:
-        match_idx = frames_df.with_row_index().filter(pl.col("pk") == matches["pk"][0])["index"][0]
+        match_idx = frames_df.with_row_index().filter(pl.col("pk") == matches["pk"][0])[
+            "index"
+        ][0]
         set_i(match_idx)
+        search_result = mo.callout(f"Found: **{matches['pk'][0]}**", kind="success")
+    else:
+        search_result = mo.callout(f"No match found for '{pk_search.value}'", kind="warn")
+    search_result
     return
 
 
@@ -158,29 +212,47 @@ def _(
     show_overlay,
 ):
     current_frame = frames_df.row(get_i(), named=True) if len(frames_df) > 0 else None
-    info_str = (
-        f"**{current_frame['pk']}** ({get_i() + 1}/{len(frames_df)}) | Dataset: {current_frame['dataset']}"
-        if current_frame
-        else "No frames"
-    )
+    if current_frame:
+        dataset_label = current_frame["dataset"] or "(No Dataset)"
+        info_str = f"**{current_frame['pk']}** ({get_i() + 1}/{len(frames_df)}) | Dataset: {dataset_label}"
+    else:
+        info_str = "No frames"
 
-    mo.vstack(
-        [
-            mo.hstack([prev_button, next_button, mo.md(info_str)], justify="start"),
-            mo.hstack([idx_slider], justify="start"),
-            mo.hstack([pk_search, search_button], justify="start"),
-            mo.hstack(
-                [show_original, show_mask, show_overlay, mo.md(f"Cols: {cols_slider.value}"), cols_slider],
-                justify="start",
-            ),
-        ]
-    )
+    mo.vstack([
+        mo.hstack([prev_button, next_button, mo.md(info_str)], justify="start"),
+        mo.hstack([idx_slider], justify="start"),
+        mo.hstack([pk_search, search_button], justify="start"),
+        mo.hstack(
+            [
+                show_original,
+                show_mask,
+                show_overlay,
+                mo.md(f"Cols: {cols_slider.value}"),
+                cols_slider,
+            ],
+            justify="start",
+        ),
+    ])
     return (current_frame,)
 
 
 @app.cell
 def _(Image, np):
-    def create_overlay(img_path: str, mask_path: str, alpha: float = 0.5) -> Image.Image:
+    # Target ~200KB: for JPEG at quality 85, ~800px max dimension is reasonable
+    MAX_DISPLAY_SIZE = 800
+
+    def resize_for_display(img: Image.Image) -> Image.Image:
+        """Resize image to fit within MAX_DISPLAY_SIZE while preserving aspect ratio."""
+        w, h = img.size
+        if max(w, h) <= MAX_DISPLAY_SIZE:
+            return img
+        scale = MAX_DISPLAY_SIZE / max(w, h)
+        new_size = (int(w * scale), int(h * scale))
+        return img.resize(new_size, Image.Resampling.LANCZOS)
+
+    def create_overlay(
+        img_path: str, mask_path: str, alpha: float = 0.5
+    ) -> Image.Image:
         img = Image.open(img_path).convert("RGB")
         mask = Image.open(mask_path)
         mask_arr = np.array(mask)
@@ -206,23 +278,24 @@ def _(Image, np):
                     overlay[:, :, c],
                 )
 
-        return Image.fromarray(overlay.astype(np.uint8))
+        result = Image.fromarray(overlay.astype(np.uint8))
+        return resize_for_display(result)
 
     def colorize_mask(mask_path: str) -> Image.Image:
         mask = Image.open(mask_path)
         mask_arr = np.array(mask)
 
         colors = [
-            (0, 0, 0),        # 0 = black (background)
-            (255, 0, 0),      # 1 = red
-            (0, 255, 0),      # 2 = green
-            (0, 0, 255),      # 3 = blue
-            (255, 255, 0),    # 4 = yellow
-            (255, 0, 255),    # 5 = magenta
-            (0, 255, 255),    # 6 = cyan
-            (255, 128, 0),    # 7 = orange
-            (128, 0, 255),    # 8 = purple
-            (0, 255, 128),    # 9 = spring green
+            (0, 0, 0),  # 0 = black (background)
+            (255, 0, 0),  # 1 = red
+            (0, 255, 0),  # 2 = green
+            (0, 0, 255),  # 3 = blue
+            (255, 255, 0),  # 4 = yellow
+            (255, 0, 255),  # 5 = magenta
+            (0, 255, 255),  # 6 = cyan
+            (255, 128, 0),  # 7 = orange
+            (128, 0, 255),  # 8 = purple
+            (0, 255, 128),  # 9 = spring green
         ]
 
         colored = np.zeros((*mask_arr.shape, 3), dtype=np.uint8)
@@ -234,17 +307,20 @@ def _(Image, np):
             mask_region = mask_arr == obj_id
             colored[mask_region] = color
 
-        return Image.fromarray(colored)
-    return colorize_mask, create_overlay
+        result = Image.fromarray(colored)
+        return resize_for_display(result)
+    return colorize_mask, create_overlay, resize_for_display
 
 
 @app.cell
 def _(
+    Image,
     colorize_mask,
     create_overlay,
     current_frame,
     mo,
     pathlib,
+    resize_for_display,
     show_mask,
     show_original,
     show_overlay,
@@ -265,7 +341,9 @@ def _(
             return mo.md(f"Image not found: {img_path}")
 
         if show_original.value:
-            imgs.append(mo.image(img_path, rounded=True))
+            orig_img = Image.open(img_path).convert("RGB")
+            orig_img = resize_for_display(orig_img)
+            imgs.append(mo.image(orig_img, rounded=True))
 
         if show_mask.value:
             colored_mask = colorize_mask(mask_path)

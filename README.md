@@ -26,3 +26,13 @@ Finally, save your masks to disk. Then run `uv run inference.py spec.json`.
 You can validate that your images work by using `uv run view.py PATH`:
 
 ![View mask](docs/assets/example-mask.png)
+
+# Test Cases
+
+## EXIF Rotation
+
+Some camera images have EXIF metadata specifying rotation. PIL doesn't auto-apply this rotation, but browsers do, which can cause masks to appear flipped/mirrored relative to the displayed image.
+
+**Test image**: `CAM036564_v.JPG` (from dataset=none group, seed 42, frame 0)
+
+The fix is to use `ImageOps.exif_transpose()` when loading images in `app.py`.
