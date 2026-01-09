@@ -14,12 +14,11 @@ Valid SAM2 model names (HuggingFace):
 """
 
 import collections
+import dataclasses
 import logging
 import pathlib
-import random
 import sys
 import time
-import dataclasses
 
 import beartype
 import duckdb

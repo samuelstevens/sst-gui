@@ -12,6 +12,7 @@ def _():
     import numpy as np
     import polars as pl
     from PIL import Image
+
     return Image, mo, np, pathlib, pl
 
 
@@ -182,7 +183,9 @@ def _(frames_df, mo, pk_search, pl, search_button, set_i):
         set_i(match_idx)
         search_result = mo.callout(f"Found: **{matches['pk'][0]}**", kind="success")
     else:
-        search_result = mo.callout(f"No match found for '{pk_search.value}'", kind="warn")
+        search_result = mo.callout(
+            f"No match found for '{pk_search.value}'", kind="warn"
+        )
     search_result
     return
 
@@ -309,6 +312,7 @@ def _(Image, np):
 
         result = Image.fromarray(colored)
         return resize_for_display(result)
+
     return colorize_mask, create_overlay, resize_for_display
 
 
