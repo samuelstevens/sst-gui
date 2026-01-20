@@ -35,16 +35,10 @@ logger = logging.getLogger("check")
 PREFERRED_EXTS = [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2"]
 COLORS = np.array(
     [
-        [0, 18, 25],
-        [0, 95, 115],
-        [10, 147, 150],
-        [148, 210, 189],
-        [233, 216, 166],
-        [238, 155, 0],
-        [202, 103, 2],
-        [187, 62, 3],
-        [174, 32, 18],
-        [155, 34, 38],
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 0],
     ],
     dtype=np.uint8,
 )
@@ -74,6 +68,7 @@ class ImageRecord:
     image_name: str
     img_fpath: pathlib.Path
     pred_mask_fpath: pathlib.Path
+    ref_mask_fpath: pathlib.Path
 
 
 @beartype.beartype
@@ -189,8 +184,15 @@ def build_records(
             logger.warning("No image path found for %s", item.image_name)
             continue
         pred_mask_fpath = spec.pred_masks / f"{item.image_name}.png"
+        ref_mask_fpath = spec.ref_masks / f"{item.image_name}.png"
         records.append(
-            ImageRecord(item.raw_key, item.image_name, img_fpath, pred_mask_fpath)
+            ImageRecord(
+                item.raw_key,
+                item.image_name,
+                img_fpath,
+                pred_mask_fpath,
+                ref_mask_fpath,
+            )
         )
     return records
 
@@ -201,10 +203,10 @@ def render_mask_rgb(mask_fpath: pathlib.Path, size: tuple[int, int]) -> Image.Im
         mask = mask.convert("L")
         mono = np.array(mask, dtype=np.uint8)
 
-    unique_vals = sorted(np.unique(mono).tolist())
     rgb = np.zeros((mono.shape[0], mono.shape[1], 3), dtype=np.uint8)
-    for color, value in zip(COLORS, unique_vals):
-        rgb[mono == value] = color
+    object_vals = [value for value in np.unique(mono) if value > 0]
+    for value in object_vals:
+        rgb[mono == value] = COLORS[(int(value) - 1) % len(COLORS)]
 
     mask_rgb = Image.fromarray(rgb)
     if mask_rgb.size != size:
@@ -215,7 +217,8 @@ def render_mask_rgb(mask_fpath: pathlib.Path, size: tuple[int, int]) -> Image.Im
 @beartype.beartype
 def draw_side_by_side(img_fpath: pathlib.Path, mask_fpath: pathlib.Path) -> None:
     with Image.open(img_fpath) as img:
-        img = img.convert("RGB")
+        orientation = read_exif_orientation(img)
+        img = apply_exif_orientation(img, orientation).convert("RGB")
         mask_rgb = render_mask_rgb(mask_fpath, img.size)
 
         gap_px = 10
@@ -226,21 +229,70 @@ def draw_side_by_side(img_fpath: pathlib.Path, mask_fpath: pathlib.Path) -> None
         combined.paste(mask_rgb, (img.width + gap_px, 0))
 
     term_image_image: types.ModuleType = importlib.import_module("term_image.image")
-    term_image_image.AutoImage(combined).draw()
+    img_obj = term_image_image.AutoImage(combined)
+    rendered_w, rendered_h = img_obj.rendered_size
+    img_obj.draw(
+        h_align="left",
+        pad_width=rendered_w,
+        v_align="top",
+        pad_height=rendered_h,
+    )
 
 
 @beartype.beartype
-def wait_for_enter() -> None:
-    prompt = "Press Enter for next..."
+def read_exif_orientation(img: Image.Image) -> int | None:
+    exif = img.getexif()
+    if not exif:
+        return None
+    orientation = exif.get(274)
+    if orientation is None:
+        return None
+    if not isinstance(orientation, int):
+        return None
+    return orientation
+
+
+@beartype.beartype
+def apply_exif_orientation(img: Image.Image, orientation: int | None) -> Image.Image:
+    if orientation is None or orientation == 1:
+        return img
+    if orientation == 2:
+        return img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    if orientation == 3:
+        return img.transpose(Image.Transpose.ROTATE_180)
+    if orientation == 4:
+        return img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    if orientation == 5:
+        return img.transpose(Image.Transpose.TRANSPOSE)
+    if orientation == 6:
+        return img.transpose(Image.Transpose.ROTATE_270)
+    if orientation == 7:
+        return img.transpose(Image.Transpose.TRANSVERSE)
+    if orientation == 8:
+        return img.transpose(Image.Transpose.ROTATE_90)
+    return img
+
+
+@beartype.beartype
+def wait_for_enter() -> bool:
+    prompt = "Press Enter for next (q to quit): "
+    response = None
     if sys.stdin.isatty():
-        input(prompt)
-        return
-    try:
-        with open("/dev/tty") as fd:
-            print(prompt, end="", flush=True)
-            fd.readline()
-    except OSError:
-        print(prompt)
+        response = input(prompt)
+    else:
+        try:
+            with open("/dev/tty") as fd:
+                print(prompt, end="", flush=True)
+                response = fd.readline()
+        except OSError:
+            print(prompt)
+            return True
+
+    if response is None:
+        return True
+    if response.strip().lower().startswith("q"):
+        return False
+    return True
 
 
 @beartype.beartype
@@ -266,20 +318,31 @@ def run(args: Args) -> None:
         logger.error("No matching records found.")
         return
 
-    for record in records:
+    total = len(records)
+    for idx, record in enumerate(records, start=1):
         if not record.img_fpath.exists():
             logger.warning("Image does not exist: %s", record.img_fpath)
             continue
-        if not record.pred_mask_fpath.exists():
-            logger.warning("Pred mask does not exist: %s", record.pred_mask_fpath)
+        if record.pred_mask_fpath.exists():
+            mask_fpath = record.pred_mask_fpath
+            mask_source = "pred"
+        elif record.ref_mask_fpath.exists():
+            mask_fpath = record.ref_mask_fpath
+            mask_source = "ref"
+        else:
+            logger.warning(
+                "Mask missing for %s; pred=%s ref=%s",
+                record.image_name,
+                record.pred_mask_fpath,
+                record.ref_mask_fpath,
+            )
             continue
-        print("")
-        print(record.raw_key)
-        print(f"image: {record.img_fpath}")
-        print(f"mask : {record.pred_mask_fpath}")
+        print(f"[{idx}/{total}] {record.raw_key}")
+        print(f"image: {record.img_fpath} | mask ({mask_source}): {mask_fpath}")
 
-        draw_side_by_side(record.img_fpath, record.pred_mask_fpath)
-        wait_for_enter()
+        draw_side_by_side(record.img_fpath, mask_fpath)
+        if not wait_for_enter():
+            return
 
 
 if __name__ == "__main__":
