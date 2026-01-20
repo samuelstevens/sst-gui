@@ -75,6 +75,10 @@ type alias Model =
     , selectedMasks : Dict Int Int -- mask_id -> label
     , maskScale : Float
     , loadingMasks : Bool
+
+    -- Search
+    , groupSearchQuery : String
+    , searchResults : List SearchResult
     }
 
 
@@ -103,6 +107,14 @@ type alias MaskMeta =
     , score : Maybe Float
     , area : Maybe Int
     , url : String
+    }
+
+
+type alias SearchResult =
+    { pk : String
+    , imgPath : String
+    , groupKey : String
+    , groupDisplay : Dict String String
     }
 
 
@@ -156,6 +168,8 @@ init _ url key =
       , selectedMasks = Dict.empty
       , maskScale = 0.25
       , loadingMasks = False
+      , groupSearchQuery = ""
+      , searchResults = []
       }
     , initState.cmd
     )
@@ -266,6 +280,11 @@ type Msg
       -- Navigation
     | GoToPage Page
     | DismissError
+      -- Search
+    | SetGroupSearchQuery String
+    | SearchAllFrames
+    | GotSearchResults (Result Http.Error SearchResponse)
+    | GoToSearchResult SearchResult
 
 
 type alias ProjectCreatedResponse =
@@ -295,6 +314,11 @@ type alias MasksResponse =
 
 type alias SelectionSavedResponse =
     { savedFpath : String
+    }
+
+
+type alias SearchResponse =
+    { results : List SearchResult
     }
 
 
@@ -645,6 +669,59 @@ update msg model =
         DismissError ->
             ( { model | error = Nothing }, Cmd.none )
 
+        SetGroupSearchQuery query ->
+            ( { model | groupSearchQuery = query }, Cmd.none )
+
+        SearchAllFrames ->
+            case model.projectId of
+                Just pid ->
+                    if String.length model.groupSearchQuery >= 2 then
+                        ( model, searchAllFrames pid model.groupSearchQuery )
+
+                    else
+                        ( { model | searchResults = [] }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        GotSearchResults result ->
+            case result of
+                Ok resp ->
+                    ( { model | searchResults = resp.results }, Cmd.none )
+
+                Err err ->
+                    ( { model | error = Just (httpErrorToString err) }, Cmd.none )
+
+        GoToSearchResult searchResult ->
+            case model.projectId of
+                Just pid ->
+                    -- Add the frame to sampled_frames and go to MasksPage
+                    let
+                        newFrame =
+                            { pk = searchResult.pk
+                            , imgPath = searchResult.imgPath
+                            , masksCached = False
+                            }
+                    in
+                    ( { model
+                        | frames = [ newFrame ]
+                        , currentFrameIndex = 0
+                        , page = MasksPage
+                        , masks = []
+                        , selectedMasks = Dict.empty
+                        , loadingMasks = True
+                        , searchResults = []
+                        , groupSearchQuery = ""
+                      }
+                    , Cmd.batch
+                        [ Nav.pushUrl model.key (routeToUrl (MasksRoute pid 0))
+                        , computeMasks pid searchResult.pk model.maskScale
+                        ]
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
 
 
 -- HTTP
@@ -756,6 +833,14 @@ saveSelection projectId pk selectedMasks =
         }
 
 
+searchAllFrames : String -> String -> Cmd Msg
+searchAllFrames projectId query =
+    Http.get
+        { url = "/api/projects/" ++ projectId ++ "/search?q=" ++ Url.percentEncode query
+        , expect = Http.expectJson GotSearchResults searchResponseDecoder
+        }
+
+
 
 -- DECODERS
 
@@ -818,6 +903,21 @@ selectionSavedDecoder : D.Decoder SelectionSavedResponse
 selectionSavedDecoder =
     D.map SelectionSavedResponse
         (D.field "saved_fpath" D.string)
+
+
+searchResponseDecoder : D.Decoder SearchResponse
+searchResponseDecoder =
+    D.map SearchResponse
+        (D.field "results" (D.list searchResultDecoder))
+
+
+searchResultDecoder : D.Decoder SearchResult
+searchResultDecoder =
+    D.map4 SearchResult
+        (D.field "pk" D.string)
+        (D.field "img_path" D.string)
+        (D.field "group_key" D.string)
+        (D.field "group_display" (D.dict D.string))
 
 
 httpErrorToString : Http.Error -> String
@@ -951,6 +1051,38 @@ viewGroupsPage model =
             [ text ("Project: " ++ Maybe.withDefault "" model.projectId)
             , text (" | " ++ String.fromInt model.rowCount ++ " rows, " ++ String.fromInt model.groupCount ++ " groups")
             ]
+
+        -- Search box
+        , div [ class "mb-4 p-3 bg-gray-50 border rounded" ]
+            [ div [ class "flex gap-2 items-center" ]
+                [ span [ class "text-sm font-medium" ] [ text "Jump to frame:" ]
+                , input
+                    [ type_ "text"
+                    , placeholder "Search by name (min 2 chars)..."
+                    , value model.groupSearchQuery
+                    , onInput SetGroupSearchQuery
+                    , onEnter SearchAllFrames
+                    , class "border rounded px-2 py-1 text-sm flex-1"
+                    ]
+                    []
+                , button
+                    [ onClick SearchAllFrames
+                    , class "bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 text-sm"
+                    ]
+                    [ text "Search" ]
+                ]
+            , if not (List.isEmpty model.searchResults) then
+                div [ class "mt-2 border rounded bg-white max-h-48 overflow-y-auto" ]
+                    (List.map viewSearchResult model.searchResults)
+
+              else if String.length model.groupSearchQuery >= 2 then
+                div [ class "mt-2 text-sm text-gray-500" ] [ text "No results found" ]
+
+              else
+                text ""
+            ]
+
+        -- Sampling options
         , div [ class "grid grid-cols-2 gap-4 mb-4" ]
             [ viewInput "Number of reference frames" model.nRefFrames SetNRefFrames
             , viewInput "Random seed" model.seed SetSeed
@@ -965,6 +1097,24 @@ viewGroupsPage model =
                 ]
                 [ text "Sample Frames" ]
             ]
+        ]
+
+
+viewSearchResult : SearchResult -> Html Msg
+viewSearchResult result =
+    let
+        groupText =
+            result.groupDisplay
+                |> Dict.toList
+                |> List.map (\( k, v ) -> k ++ "=" ++ v)
+                |> String.join ", "
+    in
+    div
+        [ onClick (GoToSearchResult result)
+        , class "p-2 border-b cursor-pointer hover:bg-blue-50 text-sm"
+        ]
+        [ div [ class "font-medium" ] [ text result.pk ]
+        , div [ class "text-gray-500 text-xs" ] [ text groupText ]
         ]
 
 
@@ -1340,3 +1490,18 @@ viewMaskThumbnail model idx mask =
 fileDecoder : D.Decoder File
 fileDecoder =
     D.at [ "target", "files" ] (D.index 0 File.decoder)
+
+
+onEnter : Msg -> Html.Attribute Msg
+onEnter msg =
+    on "keydown"
+        (D.field "key" D.string
+            |> D.andThen
+                (\key ->
+                    if key == "Enter" then
+                        D.succeed msg
+
+                    else
+                        D.fail "Not Enter"
+                )
+        )

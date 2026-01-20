@@ -6,6 +6,7 @@ import pathlib
 import random
 import threading
 import traceback
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 
@@ -475,7 +476,7 @@ def build_masks_response(
                 mask_id=i,
                 score=scores[i] if i < len(scores) else None,
                 area=areas[i] if i < len(areas) else None,
-                url=f"/api/projects/{project_id}/frames/{pk}/masks/{i}?scale={scale}",
+                url=f"/api/projects/{project_id}/frames/{urllib.parse.quote(pk, safe='')}/masks/{i}?scale={scale}",
             )
             for i in range(n_masks)
         ],
@@ -592,6 +593,47 @@ async def save_selection(project_id: str, pk: str, data: SelectionRequest) -> Re
     return Response(content={"saved_fpath": str(saved_fpath)}, status_code=200)
 
 
+class FrameSearchResult(BaseModel):
+    pk: str
+    img_path: str
+    group_key: str
+    group_display: dict[str, str]
+
+
+@get("/api/projects/{project_id:str}/search")
+@beartype.beartype
+async def search_frames(project_id: str, q: str = "") -> dict[str, object]:
+    """Search all frames across all groups by primary key substring match."""
+    project = get_project_or_404(project_id)
+    if not q:
+        return {"results": []}
+
+    query_lower = q.lower()
+    results: list[FrameSearchResult] = []
+
+    # Build group_key -> group_display mapping
+    group_display_map = {g.group_key: g.group_display for g in project.groups}
+
+    for group_key, frames in project.frames_by_group.items():
+        group_display = group_display_map.get(group_key, {})
+        for frame in frames:
+            if query_lower in frame.pk.lower():
+                results.append(
+                    FrameSearchResult(
+                        pk=frame.pk,
+                        img_path=frame.img_path,
+                        group_key=group_key,
+                        group_display=group_display,
+                    )
+                )
+                if len(results) >= 20:  # Limit results
+                    break
+        if len(results) >= 20:
+            break
+
+    return {"results": [r.model_dump() for r in results]}
+
+
 @get("/api/projects/{project_id:str}/spec")
 @beartype.beartype
 async def get_spec(project_id: str) -> Response:
@@ -654,6 +696,7 @@ def create_app() -> Litestar:
             compute_masks,
             get_mask_preview,
             save_selection,
+            search_frames,
             get_spec,
             health,
             index,
