@@ -3,85 +3,7 @@
 import numpy as np
 import pytest
 
-
-def get_centroid(mask: np.ndarray) -> tuple[float, float]:
-    """Compute centroid from bounding box of mask pixels."""
-    ys, xs = np.where(mask > 0)
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
-    return ((x_min + x_max) / 2, (y_min + y_max) / 2)
-
-
-def assign_quadrant_ids(
-    mask: np.ndarray, img_height: int, img_width: int
-) -> np.ndarray:
-    """Assign quadrant-based IDs to masks.
-
-    Args:
-        mask: Single-channel mask with object IDs (0 = background)
-        img_height: Original image height (for single-mask case)
-        img_width: Original image width (for single-mask case)
-
-    Returns:
-        Transformed mask with quadrant-based IDs (1-4)
-    """
-    assert mask.shape == (img_height, img_width), (
-        f"Mask shape {mask.shape} must match image dimensions ({img_height}, {img_width})"
-    )
-    obj_ids = [i for i in np.unique(mask) if i > 0]
-    assert len(obj_ids) >= 1, "Position mode requires at least 1 mask"
-    assert len(obj_ids) <= 4, f"Position mode requires <=4 masks, got {len(obj_ids)}"
-
-    # Compute centroids
-    centroids = {}
-    for obj_id in obj_ids:
-        centroids[obj_id] = get_centroid(mask == obj_id)
-
-    # Compute split point
-    if len(centroids) == 1:
-        # Single mask: use image center
-        split_x = img_width / 2
-        split_y = img_height / 2
-    else:
-        # Multiple masks: use mean of centroids
-        split_x = sum(c[0] for c in centroids.values()) / len(centroids)
-        split_y = sum(c[1] for c in centroids.values()) / len(centroids)
-
-    # Assign quadrant IDs
-    new_mask = np.zeros_like(mask)
-    quadrants_used = set()
-    EPS = 1e-9
-
-    for obj_id, (cx, cy) in centroids.items():
-        assert abs(cx - split_x) > EPS, (
-            f"Centroid x too close to split point: cx={cx}, split_x={split_x}"
-        )
-        assert abs(cy - split_y) > EPS, (
-            f"Centroid y too close to split point: cy={cy}, split_y={split_y}"
-        )
-
-        if cx < split_x and cy < split_y:
-            quadrant_id = 1  # top-left
-        elif cx > split_x and cy < split_y:
-            quadrant_id = 2  # top-right
-        elif cx < split_x and cy > split_y:
-            quadrant_id = 3  # bottom-left
-        else:
-            quadrant_id = 4  # bottom-right
-
-        assert quadrant_id not in quadrants_used, (
-            f"Quadrant collision: multiple masks in quadrant {quadrant_id}"
-        )
-        quadrants_used.add(quadrant_id)
-
-        new_mask[mask == obj_id] = quadrant_id
-
-    return new_mask
-
-
-def collapse_to_binary(mask: np.ndarray) -> np.ndarray:
-    """Collapse all objects to single ID."""
-    return (mask > 0).astype(mask.dtype)
+import lib
 
 
 def make_mask_with_blobs(
@@ -107,14 +29,14 @@ class TestGetCentroid:
         # 10x10 blob at (5,5) to (14,14) -> centroid at (9.5, 9.5)
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[5:15, 5:15] = 1
-        cx, cy = get_centroid(mask)
+        cx, cy = lib.get_centroid(mask)
         assert cx == 9.5
         assert cy == 9.5
 
     def test_single_pixel(self):
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[50, 30] = 1
-        cx, cy = get_centroid(mask)
+        cx, cy = lib.get_centroid(mask)
         assert cx == 30.0
         assert cy == 50.0
 
@@ -122,7 +44,7 @@ class TestGetCentroid:
         # Blob from (10,20) to (90,30) -> centroid at (50, 25)
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[20:31, 10:91] = 1
-        cx, cy = get_centroid(mask)
+        cx, cy = lib.get_centroid(mask)
         assert cx == 50.0
         assert cy == 25.0
 
@@ -145,7 +67,7 @@ class TestAssignQuadrantIds:
             },
         )
 
-        result = assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
         # Check that each original region got the expected quadrant ID
         assert result[10, 10] == 1  # top-left
@@ -168,9 +90,29 @@ class TestAssignQuadrantIds:
             },
         )
 
-        result = assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
         assert result[20, 10] == 1  # top-left -> ID 1
+        assert result[70, 80] == 4  # bottom-right -> ID 4
+
+    def test_two_masks_bottom_half(self):
+        """Two masks both in bottom half use image center for split_y.
+
+        This is the CAM036161_d case that motivated the same-half logic.
+        Both masks in bottom half (y > 50), so split_y = 50 (image center).
+        Expected: quadrants 3 (bottom-left) and 4 (bottom-right).
+        """
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                1: (15, 70, 25, 80),  # centroid ~(19.5, 74.5) -> bottom-left
+                2: (75, 65, 85, 75),  # centroid ~(79.5, 69.5) -> bottom-right
+            },
+        )
+
+        result = lib.assign_quadrant_ids(mask, 100, 100)
+
+        assert result[75, 20] == 3  # bottom-left -> ID 3
         assert result[70, 80] == 4  # bottom-right -> ID 4
 
     def test_two_masks_horizontal(self):
@@ -187,7 +129,7 @@ class TestAssignQuadrantIds:
             },
         )
 
-        result = assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
         # With mean_y ~50.5, mask 1 (y=50) is top, mask 2 (y=51) is bottom
         # mask 1: x=20 < mean_x=50, y=50 < mean_y=50.5 -> top-left = 1
@@ -211,7 +153,7 @@ class TestAssignQuadrantIds:
             },
         )
 
-        result = assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
         assert result[20, 20] == 1  # top-left
         assert result[20, 80] == 2  # top-right
@@ -230,7 +172,7 @@ class TestAssignQuadrantIds:
             },
         )
 
-        result = assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
         assert result[20, 20] == 1  # top-left
 
@@ -247,7 +189,7 @@ class TestAssignQuadrantIds:
             },
         )
 
-        result = assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
         assert result[80, 80] == 4  # bottom-right
 
@@ -263,7 +205,7 @@ class TestAssignQuadrantIds:
         with pytest.raises(
             AssertionError, match="Mask shape .* must match image dimensions"
         ):
-            assign_quadrant_ids(mask, 200, 200)  # Mismatched dimensions
+            lib.assign_quadrant_ids(mask, 200, 200)  # Mismatched dimensions
 
     def test_single_mask_at_image_center_fails(self):
         """Single mask centered on image center should fail (tie on both axes)."""
@@ -281,7 +223,7 @@ class TestAssignQuadrantIds:
         )
 
         with pytest.raises(AssertionError, match="Centroid x too close to split point"):
-            assign_quadrant_ids(mask, 100, 100)
+            lib.assign_quadrant_ids(mask, 100, 100)
 
     def test_empty_mask_fails(self):
         """Empty mask (no objects) should assert - refs must have at least 1 mask."""
@@ -290,7 +232,7 @@ class TestAssignQuadrantIds:
         with pytest.raises(
             AssertionError, match="Position mode requires at least 1 mask"
         ):
-            assign_quadrant_ids(mask, 100, 100)
+            lib.assign_quadrant_ids(mask, 100, 100)
 
     def test_more_than_four_masks_fails(self):
         """More than 4 masks should assert."""
@@ -306,7 +248,7 @@ class TestAssignQuadrantIds:
         )
 
         with pytest.raises(AssertionError, match="Position mode requires <=4 masks"):
-            assign_quadrant_ids(mask, 100, 100)
+            lib.assign_quadrant_ids(mask, 100, 100)
 
     def test_collision_same_quadrant_fails(self):
         """Two masks in the same quadrant should assert.
@@ -328,41 +270,182 @@ class TestAssignQuadrantIds:
         )
 
         with pytest.raises(AssertionError, match="Quadrant collision"):
-            assign_quadrant_ids(mask, 100, 100)
+            lib.assign_quadrant_ids(mask, 100, 100)
 
-    def test_centroid_on_x_axis_fails(self):
-        """Centroid with cx == split_x should fail even if cy != split_y.
+    def test_two_masks_same_x_half_uses_image_center(self):
+        """Two masks in same horizontal half use image center for split_x.
 
-        Two masks with centroids at (50, 20) and (50, 80).
-        Mean = (50, 50). Both have cx == split_x, should fail.
+        Two masks with centroids at ~(49.5, 19.5) and ~(49.5, 79.5).
+        Both are in left half (x < 50), so split_x = 50 (image center).
+        Expected: quadrants 1 (top-left) and 3 (bottom-left).
         """
         mask = make_mask_with_blobs(
             (100, 100),
             {
-                1: (45, 15, 55, 25),  # centroid = (50, 20)
-                2: (45, 75, 55, 85),  # centroid = (50, 80)
+                1: (45, 15, 55, 25),  # centroid ~(49.5, 19.5) -> top-left
+                2: (45, 75, 55, 85),  # centroid ~(49.5, 79.5) -> bottom-left
             },
         )
 
-        with pytest.raises(AssertionError, match="Centroid x too close to split point"):
-            assign_quadrant_ids(mask, 100, 100)
+        result = lib.assign_quadrant_ids(mask, 100, 100)
 
-    def test_centroid_on_y_axis_fails(self):
-        """Centroid with cy == split_y should fail even if cx != split_x.
+        assert result[20, 50] == 1  # top-left
+        assert result[80, 50] == 3  # bottom-left
 
-        Two masks with centroids at (20, 50) and (80, 50).
-        Mean = (50, 50). Both have cy == split_y, should fail.
+    def test_two_masks_same_y_half_uses_image_center(self):
+        """Two masks in same vertical half use image center for split_y.
+
+        Two masks with centroids at ~(19.5, 49.5) and ~(79.5, 49.5).
+        Both are in top half (y < 50), so split_y = 50 (image center).
+        Expected: quadrants 1 (top-left) and 2 (top-right).
         """
         mask = make_mask_with_blobs(
             (100, 100),
             {
-                1: (15, 45, 25, 55),  # centroid = (20, 50)
-                2: (75, 45, 85, 55),  # centroid = (80, 50)
+                1: (15, 45, 25, 55),  # centroid ~(19.5, 49.5) -> top-left
+                2: (75, 45, 85, 55),  # centroid ~(79.5, 49.5) -> top-right
+            },
+        )
+
+        result = lib.assign_quadrant_ids(mask, 100, 100)
+
+        assert result[50, 20] == 1  # top-left
+        assert result[50, 80] == 2  # top-right
+
+    def test_centroid_at_mean_split_point_fails(self):
+        """Centroid at calculated mean split point should fail.
+
+        Two masks spanning both halves: centroids at (40, 50) and (60, 50).
+        X: not all_left, not all_right -> split_x = mean = 50
+        Y: not all_top, not all_bottom -> split_y = mean = 50
+        Both have cy == split_y, should fail.
+        """
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                # centroid_x = (35+45)/2 = 40, centroid_y = (45+55)/2 = 50
+                1: (35, 45, 46, 56),
+                # centroid_x = (55+65)/2 = 60, centroid_y = (45+55)/2 = 50
+                2: (55, 45, 66, 56),
             },
         )
 
         with pytest.raises(AssertionError, match="Centroid y too close to split point"):
-            assign_quadrant_ids(mask, 100, 100)
+            lib.assign_quadrant_ids(mask, 100, 100)
+
+
+class TestGetObjIds:
+    """Tests for get_obj_ids - extracting object IDs from masks."""
+
+    def test_multiple_objects(self):
+        """Returns sorted list of non-zero object IDs."""
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                3: (5, 5, 15, 15),
+                1: (85, 5, 95, 15),
+                4: (5, 85, 15, 95),
+            },
+        )
+
+        result = lib.get_obj_ids(mask)
+
+        assert result == [1, 3, 4]  # sorted
+
+    def test_empty_mask(self):
+        """Empty mask returns empty list."""
+        mask = np.zeros((100, 100), dtype=np.uint8)
+
+        result = lib.get_obj_ids(mask)
+
+        assert result == []
+
+    def test_excludes_background(self):
+        """Background (0) is excluded from results."""
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        mask[10:20, 10:20] = 5
+        mask[30:40, 30:40] = 0  # explicitly background
+
+        result = lib.get_obj_ids(mask)
+
+        assert result == [5]
+        assert 0 not in result
+
+
+class TestTransformMaskForMode:
+    """Tests for transform_mask_for_mode - the main entry point per spec."""
+
+    def test_original_mode_unchanged(self):
+        """Original mode returns mask unchanged."""
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                7: (5, 5, 15, 15),
+                3: (85, 85, 95, 95),
+            },
+        )
+
+        result = lib.transform_mask_for_mode(mask, "original", 100, 100)
+
+        assert np.array_equal(result, mask)
+        assert result[10, 10] == 7
+        assert result[90, 90] == 3
+
+    def test_binary_mode_collapses_ids(self):
+        """Binary mode collapses all non-zero to 1."""
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                7: (5, 5, 15, 15),
+                3: (85, 85, 95, 95),
+            },
+        )
+
+        result = lib.transform_mask_for_mode(mask, "binary", 100, 100)
+
+        assert result[10, 10] == 1
+        assert result[90, 90] == 1
+        assert result[50, 50] == 0  # background
+
+    def test_position_mode_assigns_quadrants(self):
+        """Position mode assigns quadrant-based IDs."""
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                7: (5, 5, 15, 15),  # top-left -> 1
+                3: (85, 85, 95, 95),  # bottom-right -> 4
+            },
+        )
+
+        result = lib.transform_mask_for_mode(mask, "position", 100, 100)
+
+        assert result[10, 10] == 1  # was 7, now quadrant 1
+        assert result[90, 90] == 4  # was 3, now quadrant 4
+        assert result[50, 50] == 0  # background
+
+    def test_invalid_mode_raises_valueerror(self):
+        """Invalid mask_mode raises ValueError."""
+        mask = make_mask_with_blobs(
+            (100, 100),
+            {
+                1: (5, 5, 15, 15),
+            },
+        )
+
+        with pytest.raises(ValueError, match="Invalid mask_mode"):
+            lib.transform_mask_for_mode(mask, "invalid", 100, 100)
+
+    def test_position_mode_uses_correct_dimensions(self):
+        """Position mode uses img_width/height for split point calculation."""
+        # Create a non-square mask to verify dimensions are used correctly
+        mask = np.zeros((200, 100), dtype=np.uint8)  # height=200, width=100
+        mask[10:20, 10:20] = 1  # top-left of 200x100 image
+
+        result = lib.transform_mask_for_mode(mask, "position", 100, 200)
+
+        # Centroid ~(14.5, 14.5), image center (50, 100)
+        # x=14.5 < 50, y=14.5 < 100 -> top-left = 1
+        assert result[15, 15] == 1
 
 
 class TestCollapseToBinary:
@@ -378,7 +461,7 @@ class TestCollapseToBinary:
             },
         )
 
-        result = collapse_to_binary(mask)
+        result = lib.collapse_to_binary(mask)
 
         assert result[10, 10] == 1
         assert result[10, 90] == 1
@@ -389,7 +472,7 @@ class TestCollapseToBinary:
     def test_empty_mask(self):
         """Empty mask stays empty."""
         mask = np.zeros((100, 100), dtype=np.uint8)
-        result = collapse_to_binary(mask)
+        result = lib.collapse_to_binary(mask)
         assert np.all(result == 0)
 
     def test_single_object(self):
@@ -401,7 +484,7 @@ class TestCollapseToBinary:
             },
         )
 
-        result = collapse_to_binary(mask)
+        result = lib.collapse_to_binary(mask)
 
         assert result[50, 50] == 1
         assert result[10, 10] == 0
