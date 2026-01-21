@@ -2,6 +2,7 @@ import collections.abc
 import logging
 import pathlib
 import time
+from typing import Literal
 
 import beartype
 import pydantic
@@ -24,6 +25,8 @@ class Spec(pydantic.BaseModel):
     """SAM2 model name/path."""
     device: str
     """Device to run inference on (cuda/cpu)."""
+    mask_mode: Literal["original", "position", "binary"]
+    """Mask transformation mode: original, position, or binary."""
 
     @property
     def master_csv(self) -> pathlib.Path:

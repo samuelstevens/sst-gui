@@ -29,3 +29,8 @@ ignore = ["F722", "E402", "E501"]
 
 [tool.marimo.runtime]
 watcher_on_save = "autorun"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

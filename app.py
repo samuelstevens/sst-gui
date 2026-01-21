@@ -23,6 +23,8 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 from transformers import pipeline
 
+import lib
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
@@ -38,6 +40,7 @@ class ProjectConfig(BaseModel):
     root_dpath: str
     sam2_model: str
     device: str
+    mask_mode: str
     points_per_crop: int = 48
     crops_n_layers: int = 0
     pred_iou_thresh: float = 0.88
@@ -299,6 +302,16 @@ async def create_project(request: Request) -> Response:
     pred_iou_thresh = float(form.get("pred_iou_thresh", 0.88))
     stability_score_thresh = float(form.get("stability_score_thresh", 0.95))
     crops_nms_thresh = float(form.get("crops_nms_thresh", 0.7))
+    mask_mode = str(form.get("mask_mode", "original")).strip().lower()
+    if not mask_mode:
+        mask_mode = "original"
+    valid_mask_modes = {"original", "position", "binary"}
+    if mask_mode not in valid_mask_modes:
+        return error_response(
+            f"Invalid mask_mode: {mask_mode}. Must be one of: {', '.join(sorted(valid_mask_modes))}",
+            "invalid_mask_mode",
+            status_code=400,
+        )
 
     if not group_by_raw:
         return error_response(
@@ -376,7 +389,23 @@ async def create_project(request: Request) -> Response:
         pred_iou_thresh=pred_iou_thresh,
         stability_score_thresh=stability_score_thresh,
         crops_nms_thresh=crops_nms_thresh,
+        mask_mode=mask_mode,
     )
+
+    # Write spec.json to the root directory for inference.py
+    spec = lib.Spec(
+        root=pathlib.Path(root_dpath),
+        filter_query=filter_query,
+        group_by=tuple(group_cols),
+        img_path=img_path,
+        primary_key=primary_key,
+        sam2=sam2_model,
+        device=device,
+        mask_mode=mask_mode,
+    )
+    spec_fpath = pathlib.Path(root_dpath) / "spec.json"
+    spec_fpath.write_text(spec.model_dump_json(indent=2))
+    logger.info("Saved spec to %s", spec_fpath)
 
     project_id = str(uuid.uuid4())
     _PROJECTS[project_id] = ProjectState(

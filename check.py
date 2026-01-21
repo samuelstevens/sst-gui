@@ -50,6 +50,9 @@ class Args:
     spec: pathlib.Path
     """Path to spec.json."""
 
+    pred_only: bool = False
+    """Only show predicted masks; skip refs without logging."""
+
     keys: list[str] = dataclasses.field(default_factory=list)
     """Primary keys to check. If empty, read from stdin."""
 
@@ -323,7 +326,20 @@ def run(args: Args) -> None:
         if not record.img_fpath.exists():
             logger.warning("Image does not exist: %s", record.img_fpath)
             continue
-        if record.pred_mask_fpath.exists():
+        if args.pred_only:
+            if not record.pred_mask_fpath.exists():
+                if record.ref_mask_fpath.exists():
+                    continue
+                logger.warning(
+                    "Mask missing for %s; pred=%s ref=%s",
+                    record.image_name,
+                    record.pred_mask_fpath,
+                    record.ref_mask_fpath,
+                )
+                continue
+            mask_fpath = record.pred_mask_fpath
+            mask_source = "pred"
+        elif record.pred_mask_fpath.exists():
             mask_fpath = record.pred_mask_fpath
             mask_source = "pred"
         elif record.ref_mask_fpath.exists():

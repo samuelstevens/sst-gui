@@ -4,45 +4,25 @@ A GUI for the idea presented in [SST](https://arxiv.org/abs/2501.06749) - segmen
 
 ## Workflow
 
-Start the GUI with `uv run python app.py` and open http://localhost:8000 in your browser.
+1. **app.py** - Start the GUI with `uv run python app.py` and open http://localhost:8000. Upload a CSV with image metadata and configure your project: primary key, image path column/expression, grouping columns, root directory, SAM2 model, and mask mode. For each group, sample reference frames, generate candidate masks, select and label objects with integer IDs, then save to disk.
 
-Upload a CSV with image metadata and configure your project. You'll specify a primary key (unique identifier for each image), an image path column or expression, columns to group images by (e.g., by specimen or session), and a root directory for resolving image paths. You'll also choose a SAM2 model variant and a mask mode for inference.
+2. **inference.py** - Run `uv run inference.py spec.json` to propagate reference masks to all images using SAM2's memory attention. Use `--dry-run` to validate without running inference, `--batch-size N` to control batching, or `--max-frames N` to limit frames per group.
 
-For each group, sample some reference frames and generate candidate masks with SAM2. Select and label the objects you care about by assigning integer IDs, then save the masks to disk.
+3. **check.py** - Validate results with `uv run check.py --spec spec.json KEY1 KEY2 ...` to view images and masks side-by-side in the terminal. Keys can be partial matches (case-insensitive). Use `--pred-only` to skip reference masks. Pipe keys from a file: `cat keys.txt | uv run check.py --spec spec.json --pred-only`.
 
-Run inference with `uv run inference.py spec.json`. This propagates your reference masks to all other images in each group using SAM2's memory attention mechanism. Use `--dry-run` to validate reference masks without running inference, `--batch-size N` to control batch size, or `--max-frames N` to limit frames per group for debugging.
+4. **convert.py** - Convert results to ImgSegFolder format with `uv run convert.py --master-csv path/to/master.csv --pred-masks-dpath path/to/pred_masks --output-dpath path/to/output`. Resizes images (LANCZOS) and masks (NEAREST) to a target size and writes images/training/, annotations/training/, and labels.csv.
 
-Validate results with `uv run view.py path/to/pred_masks/image.png`.
+5. **upload.py** - Upload to HuggingFace Hub with `uv run upload.py --repo-id username/dataset-name --dataset-dpath path/to/segfolder`. Reads the convert.py output and pushes to the hub.
 
 ## Mask Modes
 
 The mask mode controls how mask IDs are assigned during inference:
 
-- `original`: Preserve the labeler's mask IDs exactly. Use this when you trust the labeler's semantic intent.
-- `position`: Assign IDs based on object position in a 2x2 quadrant grid (1=top-left, 2=top-right, 3=bottom-left, 4=bottom-right). Use this when objects appear in different orientations across images, like butterfly wings.
-- `binary`: Merge all objects to a single foreground class (ID=1). Use this for simple foreground/background segmentation.
+- `original`: Preserve the labeler's mask IDs exactly. Use when you trust the labeler's semantic intent.
+- `position`: Assign IDs based on object position in a 2x2 quadrant grid (1=top-left, 2=top-right, 3=bottom-left, 4=bottom-right). Use when objects appear in different orientations across images, like butterfly wings.
+- `binary`: Merge all objects to a single foreground class (ID=1). Use for simple foreground/background segmentation.
 
 For position mode, IDs are assigned based on each mask's centroid relative to the mean centroid of all masks in the image.
-
-## Screenshots
-
-First, upload metadata and tell the system how to get your images.
-
-![Upload a CSV file.](docs/assets/metadata.png)
-
-![Configure how to read and group images](docs/assets/configure.png)
-
-SAM2 generates candidate masks for sampled reference frames:
-
-![All masks in an image](docs/assets/all-masks.png)
-
-Filter and label the objects you care about:
-
-![Filtered masks in an image](docs/assets/filtered-masks.png)
-
-View predicted masks:
-
-![View mask](docs/assets/example-mask.png)
 
 ## Test Cases
 

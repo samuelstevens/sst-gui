@@ -27,7 +27,7 @@ import polars as pl
 import torch
 import transformers
 import tyro
-from PIL import Image
+from PIL import Image, ImageOps
 
 import lib
 
@@ -37,6 +37,75 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("inference")
+
+
+@beartype.beartype
+def get_centroid(mask: np.ndarray) -> tuple[float, float]:
+    """Compute centroid from bounding box of mask pixels."""
+    ys, xs = np.where(mask > 0)
+    x_min, x_max = xs.min(), xs.max()
+    y_min, y_max = ys.min(), ys.max()
+    return ((x_min + x_max) / 2, (y_min + y_max) / 2)
+
+
+@beartype.beartype
+def assign_quadrant_ids(
+    mask: np.ndarray, img_height: int, img_width: int
+) -> np.ndarray:
+    """Assign quadrant-based IDs to masks."""
+    assert mask.shape == (img_height, img_width), (
+        f"Mask shape {mask.shape} must match ({img_height}, {img_width})"
+    )
+    obj_ids = [int(x) for x in np.unique(mask) if x > 0]
+    assert len(obj_ids) >= 1, "Position mode requires at least 1 mask"
+    assert len(obj_ids) <= 4, f"Position mode requires <=4 masks, got {len(obj_ids)}"
+
+    centroids: dict[int, tuple[float, float]] = {}
+    for obj_id in obj_ids:
+        centroids[obj_id] = get_centroid(mask == obj_id)
+
+    if len(centroids) == 1:
+        split_x = img_width / 2
+        split_y = img_height / 2
+    else:
+        split_x = sum(c[0] for c in centroids.values()) / len(centroids)
+        split_y = sum(c[1] for c in centroids.values()) / len(centroids)
+
+    new_mask = np.zeros_like(mask)
+    quadrants_used: set[int] = set()
+    eps = 1e-9
+
+    for obj_id, (cx, cy) in centroids.items():
+        assert abs(cx - split_x) > eps, (
+            f"Centroid x too close to split point: cx={cx}, split_x={split_x}"
+        )
+        assert abs(cy - split_y) > eps, (
+            f"Centroid y too close to split point: cy={cy}, split_y={split_y}"
+        )
+
+        if cx < split_x and cy < split_y:
+            quadrant_id = 1
+        elif cx > split_x and cy < split_y:
+            quadrant_id = 2
+        elif cx < split_x and cy > split_y:
+            quadrant_id = 3
+        else:
+            quadrant_id = 4
+
+        assert quadrant_id not in quadrants_used, (
+            f"Quadrant collision: multiple masks in quadrant {quadrant_id}"
+        )
+        quadrants_used.add(quadrant_id)
+
+        new_mask[mask == obj_id] = quadrant_id
+
+    return new_mask
+
+
+@beartype.beartype
+def collapse_to_binary(mask: np.ndarray) -> np.ndarray:
+    """Collapse all objects to single ID."""
+    return (mask > 0).astype(mask.dtype)
 
 
 @beartype.beartype
@@ -92,11 +161,51 @@ def get_ref_masks(spec: lib.Spec, group_pks: set[str]) -> dict[str, np.ndarray]:
         if pk in group_pks:
             with Image.open(mask_fpath) as m:
                 mask = np.array(m, dtype=np.uint8)
-            # Get unique object IDs (excluding background 0)
-            obj_ids = [int(x) for x in np.unique(mask) if x > 0]
-            if obj_ids:
-                ref_masks[pk] = mask
+            ref_masks[pk] = mask
     return ref_masks
+
+
+@beartype.beartype
+def get_obj_ids(mask: np.ndarray) -> list[int]:
+    """Return sorted object IDs in a mask (excluding background)."""
+    return [int(x) for x in np.unique(mask) if x > 0]
+
+
+@beartype.beartype
+def transform_ref_masks(
+    mask_mode: str,
+    ref_frames: list[FrameMeta],
+    ref_masks: dict[str, np.ndarray]
+) -> dict[str, np.ndarray]:
+    """Transform reference masks based on mask_mode."""
+    pk_to_frame = {frame.pk: frame for frame in ref_frames}
+    transformed: dict[str, np.ndarray] = {}
+
+    for pk, mask in ref_masks.items():
+        frame = pk_to_frame.get(pk)
+        if frame is None:
+            continue
+
+        if mask_mode == "original":
+            if not get_obj_ids(mask):
+                continue
+            transformed[pk] = mask
+            continue
+
+        if mask_mode == "binary":
+            if not np.any(mask > 0):
+                continue
+            transformed[pk] = collapse_to_binary(mask)
+            continue
+
+        if mask_mode == "position":
+            img_width, img_height = frame.original_size
+            transformed[pk] = assign_quadrant_ids(mask, img_height, img_width)
+            continue
+
+        raise ValueError(f"Invalid mask_mode: {mask_mode}")
+
+    return transformed
 
 
 class ImageDataset(torch.utils.data.Dataset):
@@ -106,12 +215,13 @@ class ImageDataset(torch.utils.data.Dataset):
         self.frames = frames
         self.processor = processor
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.frames)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
         frame = self.frames[idx]
         with Image.open(frame.img_fpath) as img:
+            img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
         # Process single image - returns [1, 1, C, H, W]
         processed = self.processor.video_processor(
@@ -127,7 +237,7 @@ def precompute_vision_features(
     processor: transformers.Sam2VideoProcessor,
     frames: list[FrameMeta],
     device: str,
-    batch_size: int = 32,
+    batch_size: int,
     num_workers: int = 8,
 ) -> dict[str, dict]:
     """Pre-compute vision features for all frames using batched inference.
@@ -197,8 +307,7 @@ def predict_with_session(
     all_obj_ids = set()
     for ref_frame in ref_frames:
         mask = ref_masks[ref_frame.pk]
-        obj_ids = [int(x) for x in np.unique(mask) if x > 0]
-        all_obj_ids.update(obj_ids)
+        all_obj_ids.update(get_obj_ids(mask))
     all_obj_ids = sorted(all_obj_ids)
 
     if not all_obj_ids:
@@ -316,8 +425,53 @@ def inject_cached_features(
 
 
 @beartype.beartype
+def run_dry_run(spec: lib.Spec, frame_groups: dict[tuple, list[FrameMeta]]) -> None:
+    """Validate reference masks without running inference."""
+    logger.info("Running dry-run validation (mask_mode=%s)", spec.mask_mode)
+    error_count = 0
+
+    for group, group_frames in frame_groups.items():
+        group_pks = set(frame.pk for frame in group_frames)
+        ref_masks = get_ref_masks(spec, group_pks)
+        if not ref_masks:
+            logger.warning("Skipping group %s: no reference masks.", group)
+            continue
+
+        ref_pks = set(ref_masks.keys())
+        ref_frames = [frame for frame in group_frames if frame.pk in ref_pks]
+        for ref_frame in ref_frames:
+            mask = ref_masks[ref_frame.pk]
+            obj_ids = get_obj_ids(mask)
+            logger.info("Group %s ref %s: %d masks", group, ref_frame.pk, len(obj_ids))
+            if not obj_ids:
+                logger.warning(
+                    "Group %s ref %s has no labeled masks.", group, ref_frame.pk
+                )
+
+        try:
+            transformed = transform_ref_masks(spec.mask_mode, ref_frames, ref_masks)
+        except (AssertionError, ValueError) as exc:
+            logger.error("Group %s validation error: %s", group, exc)
+            error_count += 1
+            continue
+
+        if not transformed:
+            logger.warning("Skipping group %s: no usable reference masks.", group)
+            continue
+
+    if error_count:
+        logger.error("Dry run completed with %d validation errors.", error_count)
+    else:
+        logger.info("Dry run completed with no validation errors.")
+
+
+@beartype.beartype
 def main(
-    spec_fpath: pathlib.Path, /, batch_size: int = 16, max_frames: int | None = None
+    spec_fpath: pathlib.Path,
+    /,
+    batch_size: int = 16,
+    max_frames: int | None = None,
+    dry_run: bool = False,
 ):
     """Run batched SAM2 inference with shared memory bank.
 
@@ -325,9 +479,9 @@ def main(
         spec_fpath: Path to spec JSON file
         batch_size: Batch size for inference (number of target frames per batch)
         max_frames: Maximum number of frames per group (for debugging). If None, process all.
+        dry_run: Validate inputs without running inference or writing outputs.
     """
     spec = lib.Spec.model_validate_json(spec_fpath.read_text())
-    spec.pred_masks.mkdir(parents=True, exist_ok=True)
 
     frames = get_frames(spec)
     logger.info("Loaded %d frames", len(frames))
@@ -335,35 +489,56 @@ def main(
         logger.error("No frames found")
         return
 
+    valid_modes = {"original", "position", "binary"}
+    if spec.mask_mode not in valid_modes:
+        logger.error("Invalid mask_mode: %s", spec.mask_mode)
+        return
+
     # Group frames
     frame_groups: dict[tuple, list[FrameMeta]] = collections.defaultdict(list)
     for frame in frames:
         frame_groups[frame.group].append(frame)
 
+    if dry_run:
+        run_dry_run(spec, frame_groups)
+        return
+
+    spec.pred_masks.mkdir(parents=True, exist_ok=True)
+
     # Filter to groups with reference masks
     # group_key (columns) -> (list of frames, reference masks [pk -> mask array])
     groups_to_process: dict[tuple, tuple[list[FrameMeta], dict[str, np.ndarray]]] = {}
     for group, group_frames in frame_groups.items():
-        group_pks = set(f.pk for f in group_frames)
-        ref_masks = get_ref_masks(spec, group_pks)
-        if len(ref_masks) >= 1:
-            # Limit frames per group for debugging (keeping all reference frames)
-            if max_frames is not None and len(group_frames) > max_frames:
-                ref_pks = set(ref_masks.keys())
-                ref_frames_list = [f for f in group_frames if f.pk in ref_pks]
-                other_frames = [f for f in group_frames if f.pk not in ref_pks]
-                n_other = max(0, max_frames - len(ref_frames_list))
-                group_frames = ref_frames_list + other_frames[:n_other]
-                logger.info(
-                    "Group %s limited to %d frames (%d refs + %d targets)",
-                    group,
-                    len(group_frames),
-                    len(ref_frames_list),
-                    n_other,
-                )
-            groups_to_process[group] = (group_frames, ref_masks)
-        elif len(ref_masks) > 0:
+        group_pks = set(frame.pk for frame in group_frames)
+        raw_ref_masks = get_ref_masks(spec, group_pks)
+        if not raw_ref_masks:
             logger.warning("Skipping group %s: no reference masks.", group)
+            continue
+
+        raw_ref_pks = set(raw_ref_masks.keys())
+        raw_ref_frames = [frame for frame in group_frames if frame.pk in raw_ref_pks]
+        ref_masks = transform_ref_masks(spec.mask_mode, raw_ref_frames, raw_ref_masks)
+        if not ref_masks:
+            logger.warning("Skipping group %s: no usable reference masks.", group)
+            continue
+
+        ref_pks = set(ref_masks.keys())
+        ref_frames_list = [frame for frame in group_frames if frame.pk in ref_pks]
+
+        # Limit frames per group for debugging (keeping all reference frames)
+        if max_frames is not None and len(group_frames) > max_frames:
+            other_frames = [frame for frame in group_frames if frame.pk not in ref_pks]
+            n_other = max(0, max_frames - len(ref_frames_list))
+            group_frames = ref_frames_list + other_frames[:n_other]
+            logger.info(
+                "Group %s limited to %d frames (%d refs + %d targets)",
+                group,
+                len(group_frames),
+                len(ref_frames_list),
+                n_other,
+            )
+
+        groups_to_process[group] = (group_frames, ref_masks)
 
     if not groups_to_process:
         logger.error("No groups have reference masks. Cannot proceed.")
@@ -418,7 +593,7 @@ def main(
 
         # Pre-compute vision features for ref frames first (always needed)
         ref_features_cache = precompute_vision_features(
-            model, processor, ref_frames, spec.device, batch_size=32
+            model, processor, ref_frames, spec.device, batch_size=batch_size
         )
 
         # Process targets in batches to avoid OOM
@@ -436,7 +611,7 @@ def main(
 
             # Pre-compute vision features for this batch of targets
             batch_features_cache = precompute_vision_features(
-                model, processor, batch_targets, spec.device, batch_size=32
+                model, processor, batch_targets, spec.device, batch_size=batch_size
             )
 
             # Combine ref features with batch features
@@ -458,6 +633,8 @@ def main(
                 # Save each mask
                 for target_frame, pred_mask in zip(batch_targets, pred_masks):
                     out_fpath = spec.pred_masks / f"{target_frame.pk}.png"
+                    if spec.mask_mode == "binary":
+                        pred_mask = collapse_to_binary(pred_mask)
                     mask_img = Image.fromarray(pred_mask)
                     mask_img = mask_img.resize(
                         target_frame.original_size, Image.Resampling.NEAREST

@@ -7,5 +7,6 @@
   "img_path": "CONCAT('/local/scratch/datasets/jiggins/butterflies', RIGHT(filepath, LEN(filepath) - 6))",
   "primary_key": "Image_name",
   "sam2": "facebook/sam2.1-hiera-large",
-  "device": "cuda"
+  "device": "cuda",
+  "mask_mode": "position"
 }
