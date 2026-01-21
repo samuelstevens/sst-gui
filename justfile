@@ -7,5 +7,5 @@ lint: fmt
     uvx ruff check --fix .
 
 fmt:
-    uvx ruff format --preview .
+    # uvx ruff format --preview .
     fd -e elm | xargs elm-format --yes

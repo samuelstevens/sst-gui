@@ -5,6 +5,7 @@ import time
 from typing import Literal
 
 import beartype
+import numpy as np
 import pydantic
 
 
@@ -39,6 +40,118 @@ class Spec(pydantic.BaseModel):
     @property
     def pred_masks(self) -> pathlib.Path:
         return self.root / "pred_masks"
+
+
+@beartype.beartype
+def get_obj_ids(mask: np.ndarray) -> list[int]:
+    """Return sorted object IDs in a mask (excluding background)."""
+    return [int(x) for x in np.unique(mask) if x > 0]
+
+
+@beartype.beartype
+def get_centroid(mask: np.ndarray) -> tuple[float, float]:
+    """Compute centroid from bounding box of mask pixels."""
+    ys, xs = np.where(mask > 0)
+    x_min, x_max = xs.min(), xs.max()
+    y_min, y_max = ys.min(), ys.max()
+    return ((x_min + x_max) / 2, (y_min + y_max) / 2)
+
+
+@beartype.beartype
+def assign_quadrant_ids(
+    mask: np.ndarray, img_height: int, img_width: int
+) -> np.ndarray:
+    """Assign quadrant-based IDs to masks."""
+    assert mask.shape == (img_height, img_width), (
+        "Mask shape "
+        f"{mask.shape} must match image dimensions ({img_height}, {img_width})"
+    )
+    obj_ids = get_obj_ids(mask)
+    assert len(obj_ids) >= 1, "Position mode requires at least 1 mask"
+    assert len(obj_ids) <= 4, f"Position mode requires <=4 masks, got {len(obj_ids)}"
+
+    centroids: dict[int, tuple[float, float]] = {}
+    for obj_id in obj_ids:
+        centroids[obj_id] = get_centroid(mask == obj_id)
+
+    # Compute split point (per-dimension, same-half logic)
+    image_center_x = img_width / 2
+    image_center_y = img_height / 2
+
+    if len(centroids) == 1:
+        # Single mask: use image center
+        split_x = image_center_x
+        split_y = image_center_y
+    else:
+        # Multiple masks: per-dimension same-half check
+        cx_values = [c[0] for c in centroids.values()]
+        cy_values = [c[1] for c in centroids.values()]
+
+        # X dimension: if all on same side of image center, use image center
+        all_left = all(cx < image_center_x for cx in cx_values)
+        all_right = all(cx > image_center_x for cx in cx_values)
+        if all_left or all_right:
+            split_x = image_center_x
+        else:
+            split_x = sum(cx_values) / len(cx_values)
+
+        # Y dimension: if all on same side of image center, use image center
+        all_top = all(cy < image_center_y for cy in cy_values)
+        all_bottom = all(cy > image_center_y for cy in cy_values)
+        if all_top or all_bottom:
+            split_y = image_center_y
+        else:
+            split_y = sum(cy_values) / len(cy_values)
+
+    new_mask = np.zeros_like(mask)
+    quadrants_used: set[int] = set()
+    eps = 1e-9
+
+    for obj_id, (cx, cy) in centroids.items():
+        assert abs(cx - split_x) > eps, (
+            f"Centroid x too close to split point: cx={cx}, split_x={split_x}"
+        )
+        assert abs(cy - split_y) > eps, (
+            f"Centroid y too close to split point: cy={cy}, split_y={split_y}"
+        )
+
+        if cx < split_x and cy < split_y:
+            quadrant_id = 1
+        elif cx > split_x and cy < split_y:
+            quadrant_id = 2
+        elif cx < split_x and cy > split_y:
+            quadrant_id = 3
+        else:
+            quadrant_id = 4
+
+        assert quadrant_id not in quadrants_used, (
+            f"Quadrant collision: multiple masks in quadrant {quadrant_id}"
+        )
+        quadrants_used.add(quadrant_id)
+
+        new_mask[mask == obj_id] = quadrant_id
+
+    return new_mask
+
+
+@beartype.beartype
+def collapse_to_binary(mask: np.ndarray) -> np.ndarray:
+    """Collapse all objects to single ID."""
+    return (mask > 0).astype(mask.dtype)
+
+
+@beartype.beartype
+def transform_mask_for_mode(
+    mask: np.ndarray, mask_mode: str, img_width: int, img_height: int
+) -> np.ndarray:
+    """Transform a mask according to the mask mode."""
+    if mask_mode == "original":
+        return mask
+    if mask_mode == "binary":
+        return collapse_to_binary(mask)
+    if mask_mode == "position":
+        return assign_quadrant_ids(mask, img_height, img_width)
+    raise ValueError(f"Invalid mask_mode: {mask_mode}")
 
 
 @beartype.beartype

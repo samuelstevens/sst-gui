@@ -53,6 +53,9 @@ class Args:
     pred_only: bool = False
     """Only show predicted masks; skip refs without logging."""
 
+    ref_only: bool = False
+    """Only show reference masks; skip preds without logging."""
+
     keys: list[str] = dataclasses.field(default_factory=list)
     """Primary keys to check. If empty, read from stdin."""
 
@@ -201,11 +204,14 @@ def build_records(
 
 
 @beartype.beartype
-def render_mask_rgb(mask_fpath: pathlib.Path, size: tuple[int, int]) -> Image.Image:
+def load_mask_array(mask_fpath: pathlib.Path) -> np.ndarray:
     with Image.open(mask_fpath) as mask:
         mask = mask.convert("L")
-        mono = np.array(mask, dtype=np.uint8)
+        return np.array(mask, dtype=np.uint8)
 
+
+@beartype.beartype
+def render_mask_rgb(mono: np.ndarray, size: tuple[int, int]) -> Image.Image:
     rgb = np.zeros((mono.shape[0], mono.shape[1], 3), dtype=np.uint8)
     object_vals = [value for value in np.unique(mono) if value > 0]
     for value in object_vals:
@@ -218,11 +224,11 @@ def render_mask_rgb(mask_fpath: pathlib.Path, size: tuple[int, int]) -> Image.Im
 
 
 @beartype.beartype
-def draw_side_by_side(img_fpath: pathlib.Path, mask_fpath: pathlib.Path) -> None:
+def draw_side_by_side(img_fpath: pathlib.Path, mask: np.ndarray) -> None:
     with Image.open(img_fpath) as img:
         orientation = read_exif_orientation(img)
         img = apply_exif_orientation(img, orientation).convert("RGB")
-        mask_rgb = render_mask_rgb(mask_fpath, img.size)
+        mask_rgb = render_mask_rgb(mask, img.size)
 
         gap_px = 10
         combined_w = img.width + gap_px + mask_rgb.width
@@ -277,6 +283,14 @@ def apply_exif_orientation(img: Image.Image, orientation: int | None) -> Image.I
 
 
 @beartype.beartype
+def get_exif_transposed_size(img_fpath: pathlib.Path) -> tuple[int, int]:
+    with Image.open(img_fpath) as img:
+        orientation = read_exif_orientation(img)
+        img = apply_exif_orientation(img, orientation)
+        return img.size
+
+
+@beartype.beartype
 def wait_for_enter() -> bool:
     prompt = "Press Enter for next (q to quit): "
     response = None
@@ -308,6 +322,10 @@ def run(args: Args) -> None:
         logger.error("No keys provided via args or stdin.")
         return
 
+    if args.pred_only and args.ref_only:
+        logger.error("Cannot use --pred-only and --ref-only together.")
+        return
+
     image_names = read_master_image_names(spec.master_csv, spec.primary_key)
     resolved, missing = resolve_keys(keys, image_names)
     if missing:
@@ -321,15 +339,46 @@ def run(args: Args) -> None:
         logger.error("No matching records found.")
         return
 
+    transform_errors = 0
     total = len(records)
-    for idx, record in enumerate(records, start=1):
-        if not record.img_fpath.exists():
-            logger.warning("Image does not exist: %s", record.img_fpath)
-            continue
-        if args.pred_only:
-            if not record.pred_mask_fpath.exists():
-                if record.ref_mask_fpath.exists():
+    try:
+        for idx, record in enumerate(records, start=1):
+            if not record.img_fpath.exists():
+                logger.warning("Image does not exist: %s", record.img_fpath)
+                continue
+            if args.pred_only:
+                if not record.pred_mask_fpath.exists():
+                    if record.ref_mask_fpath.exists():
+                        continue
+                    logger.warning(
+                        "Mask missing for %s; pred=%s ref=%s",
+                        record.image_name,
+                        record.pred_mask_fpath,
+                        record.ref_mask_fpath,
+                    )
                     continue
+                mask_fpath = record.pred_mask_fpath
+                mask_source = "pred"
+            elif args.ref_only:
+                if not record.ref_mask_fpath.exists():
+                    if record.pred_mask_fpath.exists():
+                        continue
+                    logger.warning(
+                        "Mask missing for %s; pred=%s ref=%s",
+                        record.image_name,
+                        record.pred_mask_fpath,
+                        record.ref_mask_fpath,
+                    )
+                    continue
+                mask_fpath = record.ref_mask_fpath
+                mask_source = "ref"
+            elif record.pred_mask_fpath.exists():
+                mask_fpath = record.pred_mask_fpath
+                mask_source = "pred"
+            elif record.ref_mask_fpath.exists():
+                mask_fpath = record.ref_mask_fpath
+                mask_source = "ref"
+            else:
                 logger.warning(
                     "Mask missing for %s; pred=%s ref=%s",
                     record.image_name,
@@ -337,28 +386,48 @@ def run(args: Args) -> None:
                     record.ref_mask_fpath,
                 )
                 continue
-            mask_fpath = record.pred_mask_fpath
-            mask_source = "pred"
-        elif record.pred_mask_fpath.exists():
-            mask_fpath = record.pred_mask_fpath
-            mask_source = "pred"
-        elif record.ref_mask_fpath.exists():
-            mask_fpath = record.ref_mask_fpath
-            mask_source = "ref"
-        else:
-            logger.warning(
-                "Mask missing for %s; pred=%s ref=%s",
-                record.image_name,
-                record.pred_mask_fpath,
-                record.ref_mask_fpath,
-            )
-            continue
-        print(f"[{idx}/{total}] {record.raw_key}")
-        print(f"image: {record.img_fpath} | mask ({mask_source}): {mask_fpath}")
 
-        draw_side_by_side(record.img_fpath, mask_fpath)
-        if not wait_for_enter():
-            return
+            if mask_source == "ref":
+                try:
+                    mask = load_mask_array(mask_fpath)
+                    if not np.any(mask > 0):
+                        raise ValueError("Reference mask is empty")
+                    img_width, img_height = get_exif_transposed_size(record.img_fpath)
+                    mask_height, mask_width = mask.shape
+                    if (mask_width, mask_height) != (img_width, img_height):
+                        raise ValueError(
+                            "Mask size "
+                            f"{mask_width}x{mask_height} does not match image size "
+                            f"{img_width}x{img_height}"
+                        )
+                    mask = lib.transform_mask_for_mode(
+                        mask, spec.mask_mode, mask_width, mask_height
+                    )
+                except (AssertionError, ValueError) as exc:
+                    logger.error(
+                        "Skipping %s: mask transform failed: %s",
+                        record.image_name,
+                        exc,
+                    )
+                    transform_errors += 1
+                    continue
+            else:
+                mask = load_mask_array(mask_fpath)
+
+            print(f"[{idx}/{total}] {record.raw_key}")
+            print(f"image: {record.img_fpath} | mask ({mask_source}): {mask_fpath}")
+
+            draw_side_by_side(record.img_fpath, mask)
+            if not wait_for_enter():
+                return
+    finally:
+        if transform_errors:
+            logger.error(
+                "Skipped %d record(s) due to mask transform errors.",
+                transform_errors,
+            )
+        else:
+            logger.info("No mask transform errors encountered.")
 
 
 if __name__ == "__main__":

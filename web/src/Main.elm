@@ -56,6 +56,7 @@ type alias Model =
     , predIouThresh : String
     , stabilityScoreThresh : String
     , cropsNmsThresh : String
+    , maskMode : String
 
     -- Project state
     , projectId : Maybe String
@@ -139,6 +140,7 @@ type alias ProjectConfig =
     , predIouThresh : Float
     , stabilityScoreThresh : Float
     , cropsNmsThresh : Float
+    , maskMode : String
     }
 
 
@@ -183,6 +185,7 @@ init _ url key =
       , predIouThresh = "0.88"
       , stabilityScoreThresh = "0.95"
       , cropsNmsThresh = "0.7"
+      , maskMode = "original"
       , projectId = initState.projectId
       , columns = []
       , groupCount = 0
@@ -292,6 +295,7 @@ type Msg
     | SetPredIouThresh String
     | SetStabilityScoreThresh String
     | SetCropsNmsThresh String
+    | SetMaskMode String
     | SubmitProject
     | GotProjectCreated (Result Http.Error ProjectCreatedResponse)
       -- Groups
@@ -456,6 +460,9 @@ update msg model =
 
         SetCropsNmsThresh val ->
             ( { model | cropsNmsThresh = val }, Cmd.none )
+
+        SetMaskMode val ->
+            ( { model | maskMode = val }, Cmd.none )
 
         SubmitProject ->
             case model.csvFile of
@@ -807,6 +814,7 @@ createProject model file =
                 , Http.stringPart "pred_iou_thresh" model.predIouThresh
                 , Http.stringPart "stability_score_thresh" model.stabilityScoreThresh
                 , Http.stringPart "crops_nms_thresh" model.cropsNmsThresh
+                , Http.stringPart "mask_mode" model.maskMode
                 ]
         , expect = Http.expectJson GotProjectCreated projectCreatedDecoder
         , timeout = Nothing
@@ -1007,6 +1015,7 @@ projectConfigDecoder =
         |> andMap (D.field "pred_iou_thresh" D.float)
         |> andMap (D.field "stability_score_thresh" D.float)
         |> andMap (D.field "crops_nms_thresh" D.float)
+        |> andMap (D.field "mask_mode" D.string)
 
 
 andMap : D.Decoder a -> D.Decoder (a -> b) -> D.Decoder b
@@ -1190,6 +1199,19 @@ viewSetupPage model =
                     , option [ value "1.0" ] [ text "1.0 (no dedup)" ]
                     ]
                 ]
+            , div []
+                [ label [ class "block text-sm font-medium mb-1" ] [ text "Mask Mode" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "How to assign mask IDs during inference" ]
+                , select
+                    [ onInput SetMaskMode
+                    , value model.maskMode
+                    , class "block w-full border rounded p-2"
+                    ]
+                    [ option [ value "original" ] [ text "original (preserve labeler IDs)" ]
+                    , option [ value "position" ] [ text "position (quadrant-based IDs)" ]
+                    , option [ value "binary" ] [ text "binary (foreground/background)" ]
+                    ]
+                ]
             ]
 
         -- Button (full width)
@@ -1249,6 +1271,7 @@ viewProjectConfig config =
             , viewConfigItem "pred_iou_thresh" (String.fromFloat config.predIouThresh) "Model's confidence in mask accuracy. Lower = keep less confident masks"
             , viewConfigItem "stability_score_thresh" (String.fromFloat config.stabilityScoreThresh) "Mask consistency under threshold changes. Lower = keep fragile masks"
             , viewConfigItem "crops_nms_thresh" (String.fromFloat config.cropsNmsThresh) "Removes duplicate masks from overlapping crops"
+            , viewConfigItem "mask_mode" config.maskMode "Mask ID assignment: original (preserve), position (quadrant), binary (fg/bg)"
             ]
         ]
 

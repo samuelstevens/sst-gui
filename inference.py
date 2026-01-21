@@ -40,75 +40,6 @@ logger = logging.getLogger("inference")
 
 
 @beartype.beartype
-def get_centroid(mask: np.ndarray) -> tuple[float, float]:
-    """Compute centroid from bounding box of mask pixels."""
-    ys, xs = np.where(mask > 0)
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
-    return ((x_min + x_max) / 2, (y_min + y_max) / 2)
-
-
-@beartype.beartype
-def assign_quadrant_ids(
-    mask: np.ndarray, img_height: int, img_width: int
-) -> np.ndarray:
-    """Assign quadrant-based IDs to masks."""
-    assert mask.shape == (img_height, img_width), (
-        f"Mask shape {mask.shape} must match ({img_height}, {img_width})"
-    )
-    obj_ids = [int(x) for x in np.unique(mask) if x > 0]
-    assert len(obj_ids) >= 1, "Position mode requires at least 1 mask"
-    assert len(obj_ids) <= 4, f"Position mode requires <=4 masks, got {len(obj_ids)}"
-
-    centroids: dict[int, tuple[float, float]] = {}
-    for obj_id in obj_ids:
-        centroids[obj_id] = get_centroid(mask == obj_id)
-
-    if len(centroids) == 1:
-        split_x = img_width / 2
-        split_y = img_height / 2
-    else:
-        split_x = sum(c[0] for c in centroids.values()) / len(centroids)
-        split_y = sum(c[1] for c in centroids.values()) / len(centroids)
-
-    new_mask = np.zeros_like(mask)
-    quadrants_used: set[int] = set()
-    eps = 1e-9
-
-    for obj_id, (cx, cy) in centroids.items():
-        assert abs(cx - split_x) > eps, (
-            f"Centroid x too close to split point: cx={cx}, split_x={split_x}"
-        )
-        assert abs(cy - split_y) > eps, (
-            f"Centroid y too close to split point: cy={cy}, split_y={split_y}"
-        )
-
-        if cx < split_x and cy < split_y:
-            quadrant_id = 1
-        elif cx > split_x and cy < split_y:
-            quadrant_id = 2
-        elif cx < split_x and cy > split_y:
-            quadrant_id = 3
-        else:
-            quadrant_id = 4
-
-        assert quadrant_id not in quadrants_used, (
-            f"Quadrant collision: multiple masks in quadrant {quadrant_id}"
-        )
-        quadrants_used.add(quadrant_id)
-
-        new_mask[mask == obj_id] = quadrant_id
-
-    return new_mask
-
-
-@beartype.beartype
-def collapse_to_binary(mask: np.ndarray) -> np.ndarray:
-    """Collapse all objects to single ID."""
-    return (mask > 0).astype(mask.dtype)
-
-
-@beartype.beartype
 @dataclasses.dataclass(frozen=True, slots=True)
 class FrameMeta:
     pk: str
@@ -166,16 +97,8 @@ def get_ref_masks(spec: lib.Spec, group_pks: set[str]) -> dict[str, np.ndarray]:
 
 
 @beartype.beartype
-def get_obj_ids(mask: np.ndarray) -> list[int]:
-    """Return sorted object IDs in a mask (excluding background)."""
-    return [int(x) for x in np.unique(mask) if x > 0]
-
-
-@beartype.beartype
 def transform_ref_masks(
-    mask_mode: str,
-    ref_frames: list[FrameMeta],
-    ref_masks: dict[str, np.ndarray]
+    mask_mode: str, ref_frames: list[FrameMeta], ref_masks: dict[str, np.ndarray]
 ) -> dict[str, np.ndarray]:
     """Transform reference masks based on mask_mode."""
     pk_to_frame = {frame.pk: frame for frame in ref_frames}
@@ -187,20 +110,26 @@ def transform_ref_masks(
             continue
 
         if mask_mode == "original":
-            if not get_obj_ids(mask):
+            if not lib.get_obj_ids(mask):
                 continue
-            transformed[pk] = mask
+            transformed[pk] = lib.transform_mask_for_mode(
+                mask, mask_mode, frame.original_size[0], frame.original_size[1]
+            )
             continue
 
         if mask_mode == "binary":
             if not np.any(mask > 0):
                 continue
-            transformed[pk] = collapse_to_binary(mask)
+            transformed[pk] = lib.transform_mask_for_mode(
+                mask, mask_mode, frame.original_size[0], frame.original_size[1]
+            )
             continue
 
         if mask_mode == "position":
             img_width, img_height = frame.original_size
-            transformed[pk] = assign_quadrant_ids(mask, img_height, img_width)
+            transformed[pk] = lib.transform_mask_for_mode(
+                mask, mask_mode, img_width, img_height
+            )
             continue
 
         raise ValueError(f"Invalid mask_mode: {mask_mode}")
@@ -307,7 +236,7 @@ def predict_with_session(
     all_obj_ids = set()
     for ref_frame in ref_frames:
         mask = ref_masks[ref_frame.pk]
-        all_obj_ids.update(get_obj_ids(mask))
+        all_obj_ids.update(lib.get_obj_ids(mask))
     all_obj_ids = sorted(all_obj_ids)
 
     if not all_obj_ids:
@@ -441,7 +370,7 @@ def run_dry_run(spec: lib.Spec, frame_groups: dict[tuple, list[FrameMeta]]) -> N
         ref_frames = [frame for frame in group_frames if frame.pk in ref_pks]
         for ref_frame in ref_frames:
             mask = ref_masks[ref_frame.pk]
-            obj_ids = get_obj_ids(mask)
+            obj_ids = lib.get_obj_ids(mask)
             logger.info("Group %s ref %s: %d masks", group, ref_frame.pk, len(obj_ids))
             if not obj_ids:
                 logger.warning(
@@ -634,7 +563,7 @@ def main(
                 for target_frame, pred_mask in zip(batch_targets, pred_masks):
                     out_fpath = spec.pred_masks / f"{target_frame.pk}.png"
                     if spec.mask_mode == "binary":
-                        pred_mask = collapse_to_binary(pred_mask)
+                        pred_mask = lib.collapse_to_binary(pred_mask)
                     mask_img = Image.fromarray(pred_mask)
                     mask_img = mask_img.resize(
                         target_frame.original_size, Image.Resampling.NEAREST
