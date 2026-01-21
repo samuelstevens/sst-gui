@@ -355,9 +355,12 @@ def inject_cached_features(
 
 @beartype.beartype
 def run_dry_run(spec: lib.Spec, frame_groups: dict[tuple, list[FrameMeta]]) -> None:
-    """Validate reference masks without running inference."""
+    """Validate reference masks without running inference.
+
+    Outputs failed primary keys to stdout (one per line) for piping to check.py.
+    """
     logger.info("Running dry-run validation (mask_mode=%s)", spec.mask_mode)
-    error_count = 0
+    failed_pks: list[str] = []
 
     for group, group_frames in frame_groups.items():
         group_pks = set(frame.pk for frame in group_frames)
@@ -368,28 +371,32 @@ def run_dry_run(spec: lib.Spec, frame_groups: dict[tuple, list[FrameMeta]]) -> N
 
         ref_pks = set(ref_masks.keys())
         ref_frames = [frame for frame in group_frames if frame.pk in ref_pks]
-        for ref_frame in ref_frames:
-            mask = ref_masks[ref_frame.pk]
+        pk_to_frame = {frame.pk: frame for frame in ref_frames}
+
+        for pk, mask in ref_masks.items():
+            frame = pk_to_frame.get(pk)
+            if frame is None:
+                continue
+
             obj_ids = lib.get_obj_ids(mask)
-            logger.info("Group %s ref %s: %d masks", group, ref_frame.pk, len(obj_ids))
             if not obj_ids:
-                logger.warning(
-                    "Group %s ref %s has no labeled masks.", group, ref_frame.pk
-                )
+                logger.warning("Group %s ref %s: empty mask (no objects)", group, pk)
+                failed_pks.append(pk)
+                continue
 
-        try:
-            transformed = transform_ref_masks(spec.mask_mode, ref_frames, ref_masks)
-        except (AssertionError, ValueError) as exc:
-            logger.error("Group %s validation error: %s", group, exc)
-            error_count += 1
-            continue
+            try:
+                img_width, img_height = frame.original_size
+                lib.transform_mask_for_mode(mask, spec.mask_mode, img_width, img_height)
+                logger.info("Group %s ref %s: %d objects, OK", group, pk, len(obj_ids))
+            except (AssertionError, ValueError) as exc:
+                logger.error("Group %s ref %s: %s", group, pk, exc)
+                failed_pks.append(pk)
 
-        if not transformed:
-            logger.warning("Skipping group %s: no usable reference masks.", group)
-            continue
-
-    if error_count:
-        logger.error("Dry run completed with %d validation errors.", error_count)
+    if failed_pks:
+        logger.error("Dry run completed with %d failed masks.", len(failed_pks))
+        print("\n# Failed primary keys (pipe to check.py):")
+        for pk in failed_pks:
+            print(pk)
     else:
         logger.info("Dry run completed with no validation errors.")
 

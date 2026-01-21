@@ -76,6 +76,33 @@ def test_assign_quadrant_ids_four_masks_clear_quadrants():
     assert result[85, 88] == 4  # bottom-right
 
 
+def test_assign_quadrant_ids_four_masks_clustered_top_left():
+    """4 masks all in top-left region of image use mean split (not image center).
+
+    All 4 centroids are in top-left quadrant of the image, but with 4 masks
+    we always use mean, which separates them into 4 distinct quadrants.
+    This is the melp_14-108 case that motivated the 4-mask exception.
+    """
+    # All masks in top-left region of a 100x100 image (image center = 50,50)
+    mask = make_mask_with_blobs(
+        (100, 100),
+        {
+            1: (5, 5, 15, 15),  # centroid ~(10, 10)
+            2: (25, 8, 35, 18),  # centroid ~(30, 13)
+            3: (8, 25, 18, 35),  # centroid ~(13, 30)
+            4: (28, 28, 38, 38),  # centroid ~(33, 33)
+        },
+    )
+
+    result = lib.assign_quadrant_ids(mask, 100, 100)
+
+    # Mean split should be ~(21.5, 21.5), separating into 4 quadrants
+    assert result[10, 10] == 1  # top-left of cluster
+    assert result[13, 30] == 2  # top-right of cluster
+    assert result[30, 13] == 3  # bottom-left of cluster
+    assert result[33, 33] == 4  # bottom-right of cluster
+
+
 def test_assign_quadrant_ids_two_masks_diagonal():
     """2 masks from interview example.
 

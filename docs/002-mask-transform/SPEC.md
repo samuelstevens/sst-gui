@@ -32,8 +32,10 @@ Assign mask IDs based on the relative position of each mask's centroid within a 
 2. Assert at least one mask exists (empty refs are invalid)
 3. Compute centroid (bounding box center) for each mask
 4. Compute the split point (per-dimension):
-   - **X dimension**: If all centroids are in the same horizontal half (all left or all right of image center), use `image_width/2`. Otherwise, use mean of centroid x-values.
-   - **Y dimension**: If all centroids are in the same vertical half (all above or all below image center), use `image_height/2`. Otherwise, use mean of centroid y-values.
+   - **4 masks**: Always use mean of centroid values (guarantees each mask gets its own quadrant)
+   - **2-3 masks**: Apply same-half logic per dimension:
+     - **X dimension**: If all centroids are in the same horizontal half (all left or all right of image center), use `image_width/2`. Otherwise, use mean of centroid x-values.
+     - **Y dimension**: If all centroids are in the same vertical half (all above or all below image center), use `image_height/2`. Otherwise, use mean of centroid y-values.
    - **Single mask**: Always use image center (width/2, height/2)
 5. Assign quadrant ID based on position relative to split point:
    - `x < split_x` and `y < split_y` → **top-left = 1**
@@ -177,19 +179,22 @@ def assign_quadrant_ids(mask: np.ndarray, img_height: int, img_width: int) -> np
     for obj_id in obj_ids:
         centroids[obj_id] = get_centroid(mask == obj_id)
 
-    # Compute split point (per-dimension, same-half logic)
+    # Compute split point
     image_center_x = img_width / 2
     image_center_y = img_height / 2
+    cx_values = [c[0] for c in centroids.values()]
+    cy_values = [c[1] for c in centroids.values()]
 
     if len(centroids) == 1:
         # Single mask: use image center
         split_x = image_center_x
         split_y = image_center_y
+    elif len(centroids) == 4:
+        # 4 masks: always use mean (guarantees separation)
+        split_x = sum(cx_values) / len(cx_values)
+        split_y = sum(cy_values) / len(cy_values)
     else:
-        # Multiple masks: per-dimension same-half check
-        cx_values = [c[0] for c in centroids.values()]
-        cy_values = [c[1] for c in centroids.values()]
-
+        # 2-3 masks: per-dimension same-half check
         # X dimension: if all on same side, use image center
         all_left = all(cx < image_center_x for cx in cx_values)
         all_right = all(cx > image_center_x for cx in cx_values)

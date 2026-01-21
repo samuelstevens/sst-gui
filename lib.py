@@ -74,19 +74,22 @@ def assign_quadrant_ids(
     for obj_id in obj_ids:
         centroids[obj_id] = get_centroid(mask == obj_id)
 
-    # Compute split point (per-dimension, same-half logic)
+    # Compute split point
     image_center_x = img_width / 2
     image_center_y = img_height / 2
+    cx_values = [c[0] for c in centroids.values()]
+    cy_values = [c[1] for c in centroids.values()]
 
     if len(centroids) == 1:
         # Single mask: use image center
         split_x = image_center_x
         split_y = image_center_y
+    elif len(centroids) == 4:
+        # 4 masks: always use mean (guarantees separation into 4 quadrants)
+        split_x = sum(cx_values) / len(cx_values)
+        split_y = sum(cy_values) / len(cy_values)
     else:
-        # Multiple masks: per-dimension same-half check
-        cx_values = [c[0] for c in centroids.values()]
-        cy_values = [c[1] for c in centroids.values()]
-
+        # 2-3 masks: per-dimension same-half check
         # X dimension: if all on same side of image center, use image center
         all_left = all(cx < image_center_x for cx in cx_values)
         all_right = all(cx > image_center_x for cx in cx_values)
