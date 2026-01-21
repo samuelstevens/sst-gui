@@ -51,6 +51,11 @@ type alias Model =
     , rootDpath : String
     , sam2Model : String
     , device : String
+    , pointsPerCrop : String
+    , cropsNLayers : String
+    , predIouThresh : String
+    , stabilityScoreThresh : String
+    , cropsNmsThresh : String
 
     -- Project state
     , projectId : Maybe String
@@ -79,6 +84,9 @@ type alias Model =
     -- Search
     , groupSearchQuery : String
     , searchResults : List SearchResult
+
+    -- Project config (fetched from server)
+    , projectConfig : Maybe ProjectConfig
     }
 
 
@@ -118,6 +126,22 @@ type alias SearchResult =
     }
 
 
+type alias ProjectConfig =
+    { filterQuery : String
+    , groupBy : List String
+    , imgPath : String
+    , primaryKey : String
+    , rootDpath : String
+    , sam2Model : String
+    , device : String
+    , pointsPerCrop : Int
+    , cropsNLayers : Int
+    , predIouThresh : Float
+    , stabilityScoreThresh : Float
+    , cropsNmsThresh : Float
+    }
+
+
 init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init _ url key =
     let
@@ -127,7 +151,7 @@ init _ url key =
         initState =
             case route of
                 Just (ProjectRoute pid) ->
-                    { page = GroupsPage, projectId = Just pid, frameIdx = 0, cmd = fetchGroups pid }
+                    { page = GroupsPage, projectId = Just pid, frameIdx = 0, cmd = Cmd.batch [ fetchGroups pid, fetchProjectConfig pid ] }
 
                 Just (FramesRoute pid idx) ->
                     -- Treat FramesRoute same as MasksRoute (merged pages)
@@ -154,6 +178,11 @@ init _ url key =
       , rootDpath = "/local/scratch/stevens.994/datasets/cambridge-segmented"
       , sam2Model = "facebook/sam2.1-hiera-tiny"
       , device = "cuda"
+      , pointsPerCrop = "48"
+      , cropsNLayers = "0"
+      , predIouThresh = "0.88"
+      , stabilityScoreThresh = "0.95"
+      , cropsNmsThresh = "0.7"
       , projectId = initState.projectId
       , columns = []
       , groupCount = 0
@@ -170,6 +199,7 @@ init _ url key =
       , loadingMasks = False
       , groupSearchQuery = ""
       , searchResults = []
+      , projectConfig = Nothing
       }
     , initState.cmd
     )
@@ -257,11 +287,17 @@ type Msg
     | SetRootDpath String
     | SetSam2Model String
     | SetDevice String
+    | SetPointsPerCrop String
+    | SetCropsNLayers String
+    | SetPredIouThresh String
+    | SetStabilityScoreThresh String
+    | SetCropsNmsThresh String
     | SubmitProject
     | GotProjectCreated (Result Http.Error ProjectCreatedResponse)
       -- Groups
     | GotGroups (Result Http.Error GroupsResponse)
     | GotProjectInfo (Result Http.Error ProjectCreatedResponse)
+    | GotProjectConfig (Result Http.Error ProjectConfig)
     | SelectGroup String
     | SetNRefFrames String
     | SetSeed String
@@ -337,7 +373,7 @@ update msg model =
             case route of
                 Just (ProjectRoute pid) ->
                     ( { model | url = url, page = GroupsPage, projectId = Just pid }
-                    , fetchGroups pid
+                    , Cmd.batch [ fetchGroups pid, fetchProjectConfig pid ]
                     )
 
                 Just (FramesRoute pid idx) ->
@@ -406,6 +442,21 @@ update msg model =
         SetDevice val ->
             ( { model | device = val }, Cmd.none )
 
+        SetPointsPerCrop val ->
+            ( { model | pointsPerCrop = val }, Cmd.none )
+
+        SetCropsNLayers val ->
+            ( { model | cropsNLayers = val }, Cmd.none )
+
+        SetPredIouThresh val ->
+            ( { model | predIouThresh = val }, Cmd.none )
+
+        SetStabilityScoreThresh val ->
+            ( { model | stabilityScoreThresh = val }, Cmd.none )
+
+        SetCropsNmsThresh val ->
+            ( { model | cropsNmsThresh = val }, Cmd.none )
+
         SubmitProject ->
             case model.csvFile of
                 Just file ->
@@ -453,6 +504,14 @@ update msg model =
                       }
                     , Cmd.none
                     )
+
+                Err err ->
+                    ( { model | error = Just (httpErrorToString err) }, Cmd.none )
+
+        GotProjectConfig result ->
+            case result of
+                Ok config ->
+                    ( { model | projectConfig = Just config, error = Nothing }, Cmd.none )
 
                 Err err ->
                     ( { model | error = Just (httpErrorToString err) }, Cmd.none )
@@ -743,6 +802,11 @@ createProject model file =
                 , Http.stringPart "root_dpath" model.rootDpath
                 , Http.stringPart "sam2_model" model.sam2Model
                 , Http.stringPart "device" model.device
+                , Http.stringPart "points_per_crop" model.pointsPerCrop
+                , Http.stringPart "crops_n_layers" model.cropsNLayers
+                , Http.stringPart "pred_iou_thresh" model.predIouThresh
+                , Http.stringPart "stability_score_thresh" model.stabilityScoreThresh
+                , Http.stringPart "crops_nms_thresh" model.cropsNmsThresh
                 ]
         , expect = Http.expectJson GotProjectCreated projectCreatedDecoder
         , timeout = Nothing
@@ -755,6 +819,14 @@ fetchGroups projectId =
     Http.get
         { url = "/api/projects/" ++ projectId ++ "/groups?limit=1000"
         , expect = Http.expectJson GotGroups groupsDecoder
+        }
+
+
+fetchProjectConfig : String -> Cmd Msg
+fetchProjectConfig projectId =
+    Http.get
+        { url = "/api/projects/" ++ projectId ++ "/spec"
+        , expect = Http.expectJson GotProjectConfig projectConfigDecoder
         }
 
 
@@ -920,6 +992,28 @@ searchResultDecoder =
         (D.field "group_display" (D.dict D.string))
 
 
+projectConfigDecoder : D.Decoder ProjectConfig
+projectConfigDecoder =
+    D.succeed ProjectConfig
+        |> andMap (D.field "filter_query" D.string)
+        |> andMap (D.field "group_by" (D.list D.string))
+        |> andMap (D.field "img_path" D.string)
+        |> andMap (D.field "primary_key" D.string)
+        |> andMap (D.field "root_dpath" D.string)
+        |> andMap (D.field "sam2_model" D.string)
+        |> andMap (D.field "device" D.string)
+        |> andMap (D.field "points_per_crop" D.int)
+        |> andMap (D.field "crops_n_layers" D.int)
+        |> andMap (D.field "pred_iou_thresh" D.float)
+        |> andMap (D.field "stability_score_thresh" D.float)
+        |> andMap (D.field "crops_nms_thresh" D.float)
+
+
+andMap : D.Decoder a -> D.Decoder (a -> b) -> D.Decoder b
+andMap =
+    D.map2 (|>)
+
+
 httpErrorToString : Http.Error -> String
 httpErrorToString err =
     case err of
@@ -980,24 +1074,30 @@ viewSetupPage : Model -> Html Msg
 viewSetupPage model =
     div []
         [ h2 [ class "text-2xl font-bold mb-4" ] [ text "Project Setup" ]
-        , div [ class "space-y-4" ]
-            [ div []
-                [ label [ class "block text-sm font-medium mb-1" ] [ text "CSV File" ]
-                , input
-                    [ type_ "file"
-                    , accept ".csv"
-                    , on "change" (D.map CsvSelected fileDecoder)
-                    , class "block w-full text-sm border rounded p-2"
-                    ]
-                    []
+
+        -- CSV File (full width)
+        , div [ class "mb-4" ]
+            [ label [ class "block text-sm font-medium mb-1" ] [ text "CSV File" ]
+            , p [ class "text-xs text-gray-500 mb-1" ] [ text "Upload a CSV file containing frame metadata" ]
+            , input
+                [ type_ "file"
+                , accept ".csv"
+                , on "change" (D.map CsvSelected fileDecoder)
+                , class "block w-full text-sm border rounded p-2"
                 ]
-            , viewInput "Filter Query (SQL)" model.filterQuery SetFilterQuery
-            , viewInput "Group By (comma-separated columns)" model.groupBy SetGroupBy
-            , viewInput "Image Path (column or expression)" model.imgPath SetImgPath
-            , viewInput "Primary Key (column)" model.primaryKey SetPrimaryKey
-            , viewInput "Root Directory" model.rootDpath SetRootDpath
+                []
+            ]
+
+        -- Two-column grid for the rest
+        , div [ class "grid grid-cols-1 md:grid-cols-2 gap-4" ]
+            [ viewInputWithDesc "Filter Query (SQL)" "SQL query to filter the CSV data" model.filterQuery SetFilterQuery
+            , viewInputWithDesc "Group By (columns)" "Columns used to group frames for batch processing" model.groupBy SetGroupBy
+            , viewInputWithDesc "Image Path (expression)" "Column name or SQL expression for image file paths" model.imgPath SetImgPath
+            , viewInputWithDesc "Primary Key (column)" "Unique identifier column for each frame" model.primaryKey SetPrimaryKey
+            , viewInputWithDesc "Root Directory" "Root directory for saving output masks" model.rootDpath SetRootDpath
             , div []
                 [ label [ class "block text-sm font-medium mb-1" ] [ text "SAM2 Model" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Model variant. Larger = better quality but slower" ]
                 , select
                     [ onInput SetSam2Model
                     , value model.sam2Model
@@ -1011,6 +1111,7 @@ viewSetupPage model =
                 ]
             , div []
                 [ label [ class "block text-sm font-medium mb-1" ] [ text "Device" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Hardware device for inference (cuda/cpu)" ]
                 , select
                     [ onInput SetDevice
                     , value model.device
@@ -1020,7 +1121,80 @@ viewSetupPage model =
                     , option [ value "cpu" ] [ text "cpu" ]
                     ]
                 ]
-            , button
+            , div []
+                [ label [ class "block text-sm font-medium mb-1" ] [ text "Points Per Crop" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Point prompts per crop. Higher = more masks" ]
+                , select
+                    [ onInput SetPointsPerCrop
+                    , value model.pointsPerCrop
+                    , class "block w-full border rounded p-2"
+                    ]
+                    [ option [ value "32" ] [ text "32 (fewer masks, faster)" ]
+                    , option [ value "48" ] [ text "48 (default)" ]
+                    , option [ value "64" ] [ text "64 (more masks)" ]
+                    , option [ value "96" ] [ text "96 (many masks, slower)" ]
+                    ]
+                ]
+            , div []
+                [ label [ class "block text-sm font-medium mb-1" ] [ text "Crop Layers" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Multi-scale detection (buggy, keep at 0)" ]
+                , select
+                    [ onInput SetCropsNLayers
+                    , value model.cropsNLayers
+                    , class "block w-full border rounded p-2"
+                    ]
+                    [ option [ value "0" ] [ text "0 (disabled)" ]
+                    , option [ value "1" ] [ text "1 (4 crops)" ]
+                    , option [ value "2" ] [ text "2 (16 crops)" ]
+                    ]
+                ]
+            , div []
+                [ label [ class "block text-sm font-medium mb-1" ] [ text "Predicted IoU Threshold" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Model confidence filter. Lower = keep more" ]
+                , select
+                    [ onInput SetPredIouThresh
+                    , value model.predIouThresh
+                    , class "block w-full border rounded p-2"
+                    ]
+                    [ option [ value "0.5" ] [ text "0.5 (keep most)" ]
+                    , option [ value "0.7" ] [ text "0.7 (lenient)" ]
+                    , option [ value "0.88" ] [ text "0.88 (default)" ]
+                    , option [ value "0.95" ] [ text "0.95 (strict)" ]
+                    ]
+                ]
+            , div []
+                [ label [ class "block text-sm font-medium mb-1" ] [ text "Stability Threshold" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Mask consistency filter. Lower = keep more" ]
+                , select
+                    [ onInput SetStabilityScoreThresh
+                    , value model.stabilityScoreThresh
+                    , class "block w-full border rounded p-2"
+                    ]
+                    [ option [ value "0.5" ] [ text "0.5 (keep most)" ]
+                    , option [ value "0.75" ] [ text "0.75 (lenient)" ]
+                    , option [ value "0.85" ] [ text "0.85 (moderate)" ]
+                    , option [ value "0.95" ] [ text "0.95 (default)" ]
+                    ]
+                ]
+            , div []
+                [ label [ class "block text-sm font-medium mb-1" ] [ text "Crop NMS Threshold" ]
+                , p [ class "text-xs text-gray-500 mb-1" ] [ text "Duplicate removal. Lower = fewer dupes" ]
+                , select
+                    [ onInput SetCropsNmsThresh
+                    , value model.cropsNmsThresh
+                    , class "block w-full border rounded p-2"
+                    ]
+                    [ option [ value "0.5" ] [ text "0.5 (aggressive)" ]
+                    , option [ value "0.7" ] [ text "0.7 (default)" ]
+                    , option [ value "0.9" ] [ text "0.9 (keep overlapping)" ]
+                    , option [ value "1.0" ] [ text "1.0 (no dedup)" ]
+                    ]
+                ]
+            ]
+
+        -- Button (full width)
+        , div [ class "mt-4" ]
+            [ button
                 [ onClick SubmitProject
                 , class "bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
                 ]
@@ -1040,6 +1214,55 @@ viewInput labelText val toMsg =
             , class "block w-full border rounded p-2"
             ]
             []
+        ]
+
+
+viewInputWithDesc : String -> String -> String -> (String -> Msg) -> Html Msg
+viewInputWithDesc labelText description val toMsg =
+    div []
+        [ label [ class "block text-sm font-medium mb-1" ] [ text labelText ]
+        , p [ class "text-xs text-gray-500 mb-1" ] [ text description ]
+        , input
+            [ type_ "text"
+            , value val
+            , onInput toMsg
+            , class "block w-full border rounded p-2"
+            ]
+            []
+        ]
+
+
+viewProjectConfig : ProjectConfig -> Html Msg
+viewProjectConfig config =
+    div [ class "mb-4 p-3 bg-blue-50 border border-blue-200 rounded text-sm" ]
+        [ h3 [ class "font-semibold mb-2" ] [ text "Project Configuration" ]
+        , div [ class "grid grid-cols-1 md:grid-cols-2 gap-2" ]
+            [ viewConfigItem "filter_query" config.filterQuery "SQL query to filter the CSV data"
+            , viewConfigItem "group_by" (String.join ", " config.groupBy) "Columns used to group frames"
+            , viewConfigItem "img_path" config.imgPath "Column or expression for image file paths"
+            , viewConfigItem "primary_key" config.primaryKey "Unique identifier column for each frame"
+            , viewConfigItem "root_dpath" config.rootDpath "Root directory for saving output masks"
+            , viewConfigItem "sam2_model" config.sam2Model "SAM2 model variant for mask generation"
+            , viewConfigItem "device" config.device "Hardware device for inference (cuda/cpu)"
+            , viewConfigItem "points_per_crop" (String.fromInt config.pointsPerCrop) "Number of point prompts per crop. Higher = more masks"
+            , viewConfigItem "crops_n_layers" (String.fromInt config.cropsNLayers) "Multi-scale detection. Crops image into regions for smaller objects"
+            , viewConfigItem "pred_iou_thresh" (String.fromFloat config.predIouThresh) "Model's confidence in mask accuracy. Lower = keep less confident masks"
+            , viewConfigItem "stability_score_thresh" (String.fromFloat config.stabilityScoreThresh) "Mask consistency under threshold changes. Lower = keep fragile masks"
+            , viewConfigItem "crops_nms_thresh" (String.fromFloat config.cropsNmsThresh) "Removes duplicate masks from overlapping crops"
+            ]
+        ]
+
+
+viewConfigItem : String -> String -> String -> Html Msg
+viewConfigItem label val description =
+    div [ class "bg-white p-2 rounded border" ]
+        [ div [ class "font-medium text-gray-700" ] [ text label ]
+        , div [ class "text-blue-600" ] [ text val ]
+        , if String.isEmpty description then
+            text ""
+
+          else
+            div [ class "text-xs text-gray-500 mt-1" ] [ text description ]
         ]
 
 
@@ -1097,6 +1320,14 @@ viewGroupsPage model =
                 ]
                 [ text "Sample Frames" ]
             ]
+
+        -- Project config display (at bottom)
+        , case model.projectConfig of
+            Just config ->
+                viewProjectConfig config
+
+            Nothing ->
+                text ""
         ]
 
 

@@ -38,6 +38,11 @@ class ProjectConfig(BaseModel):
     root_dpath: str
     sam2_model: str
     device: str
+    points_per_crop: int = 48
+    crops_n_layers: int = 0
+    pred_iou_thresh: float = 0.88
+    stability_score_thresh: float = 0.95
+    crops_nms_thresh: float = 0.7
 
 
 class ProjectSummary(BaseModel):
@@ -122,7 +127,7 @@ def load_sam2_pipeline(model_name: str, device: str):
         "mask-generation",
         model=model_name,
         device=device,
-        points_per_batch=256,
+        points_per_batch=1024,
     )
 
 
@@ -131,7 +136,15 @@ MAX_IMAGE_DIMENSION = 2048  # Resize images larger than this to avoid OOM
 
 @beartype.beartype
 def generate_masks_sync(
-    sam2_model: str, device: str, img_fpath: pathlib.Path, scale: float
+    sam2_model: str,
+    device: str,
+    img_fpath: pathlib.Path,
+    scale: float,
+    points_per_crop: int = 48,
+    crops_n_layers: int = 0,
+    pred_iou_thresh: float = 0.88,
+    stability_score_thresh: float = 0.95,
+    crops_nms_thresh: float = 0.7,
 ) -> tuple[list[np.ndarray], list[bytes], list[float], list[int]]:
     """Run SAM2 inference synchronously (called from thread pool).
 
@@ -159,7 +172,15 @@ def generate_masks_sync(
             img = img.convert("RGB").resize(
                 (infer_w, infer_h), Image.Resampling.LANCZOS
             )
-            outputs = generator(img, points_per_batch=256)
+            outputs = generator(
+                img,
+                points_per_batch=256,
+                points_per_crop=points_per_crop,
+                crops_n_layers=crops_n_layers,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                crops_nms_thresh=crops_nms_thresh,
+            )
         logger.info(
             "Resized image from %dx%d to %dx%d for inference",
             orig_w,
@@ -171,7 +192,15 @@ def generate_masks_sync(
         with Image.open(img_fpath) as img:
             img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
-            outputs = generator(img, points_per_batch=256)
+            outputs = generator(
+                img,
+                points_per_batch=256,
+                points_per_crop=points_per_crop,
+                crops_n_layers=crops_n_layers,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                crops_nms_thresh=crops_nms_thresh,
+            )
 
     full_masks: list[np.ndarray] = []
     preview_pngs: list[bytes] = []
@@ -265,6 +294,11 @@ async def create_project(request: Request) -> Response:
     root_dpath = str(form.get("root_dpath", "")).strip()
     sam2_model = str(form.get("sam2_model", "facebook/sam2.1-hiera-tiny")).strip()
     device = str(form.get("device", "")).strip()
+    points_per_crop = int(form.get("points_per_crop", 48))
+    crops_n_layers = int(form.get("crops_n_layers", 0))
+    pred_iou_thresh = float(form.get("pred_iou_thresh", 0.88))
+    stability_score_thresh = float(form.get("stability_score_thresh", 0.95))
+    crops_nms_thresh = float(form.get("crops_nms_thresh", 0.7))
 
     if not group_by_raw:
         return error_response(
@@ -337,6 +371,11 @@ async def create_project(request: Request) -> Response:
         root_dpath=root_dpath,
         sam2_model=sam2_model,
         device=device,
+        points_per_crop=points_per_crop,
+        crops_n_layers=crops_n_layers,
+        pred_iou_thresh=pred_iou_thresh,
+        stability_score_thresh=stability_score_thresh,
+        crops_nms_thresh=crops_nms_thresh,
     )
 
     project_id = str(uuid.uuid4())
@@ -522,6 +561,11 @@ def compute_masks(project_id: str, pk: str, data: ComputeMasksRequest) -> Respon
             project.config.device,
             img_fpath,
             scale,
+            project.config.points_per_crop,
+            project.config.crops_n_layers,
+            project.config.pred_iou_thresh,
+            project.config.stability_score_thresh,
+            project.config.crops_nms_thresh,
         )
 
         _FULL_MASKS[(project_id, pk)] = full_masks
