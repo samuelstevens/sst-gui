@@ -31,9 +31,10 @@ Assign mask IDs based on the relative position of each mask's centroid within a 
 1. For each reference image, extract all non-background masks
 2. Assert at least one mask exists (empty refs are invalid)
 3. Compute centroid (bounding box center) for each mask
-4. Compute the split point:
-   - **Single mask**: Use image center (width/2, height/2) as split point
-   - **Multiple masks**: Use mean of all centroids as split point
+4. Compute the split point (per-dimension):
+   - **X dimension**: If all centroids are in the same horizontal half (all left or all right of image center), use `image_width/2`. Otherwise, use mean of centroid x-values.
+   - **Y dimension**: If all centroids are in the same vertical half (all above or all below image center), use `image_height/2`. Otherwise, use mean of centroid y-values.
+   - **Single mask**: Always use image center (width/2, height/2)
 5. Assign quadrant ID based on position relative to split point:
    - `x < split_x` and `y < split_y` → **top-left = 1**
    - `x > split_x` and `y < split_y` → **top-right = 2**
@@ -99,8 +100,8 @@ Merge all non-background masks into a single object class before conditioning SA
 }
 ```
 
-**Defaults:**
-- `mask_mode`: `"original"` (backward compatible)
+**Required fields:**
+- `mask_mode`: Must be explicitly set (no default)
 
 ## Command Line Interface
 
@@ -176,15 +177,34 @@ def assign_quadrant_ids(mask: np.ndarray, img_height: int, img_width: int) -> np
     for obj_id in obj_ids:
         centroids[obj_id] = get_centroid(mask == obj_id)
 
-    # Compute split point
+    # Compute split point (per-dimension, same-half logic)
+    image_center_x = img_width / 2
+    image_center_y = img_height / 2
+
     if len(centroids) == 1:
         # Single mask: use image center
-        split_x = img_width / 2
-        split_y = img_height / 2
+        split_x = image_center_x
+        split_y = image_center_y
     else:
-        # Multiple masks: use mean of centroids
-        split_x = sum(c[0] for c in centroids.values()) / len(centroids)
-        split_y = sum(c[1] for c in centroids.values()) / len(centroids)
+        # Multiple masks: per-dimension same-half check
+        cx_values = [c[0] for c in centroids.values()]
+        cy_values = [c[1] for c in centroids.values()]
+
+        # X dimension: if all on same side, use image center
+        all_left = all(cx < image_center_x for cx in cx_values)
+        all_right = all(cx > image_center_x for cx in cx_values)
+        if all_left or all_right:
+            split_x = image_center_x
+        else:
+            split_x = sum(cx_values) / len(cx_values)
+
+        # Y dimension: if all on same side, use image center
+        all_top = all(cy < image_center_y for cy in cy_values)
+        all_bottom = all(cy > image_center_y for cy in cy_values)
+        if all_top or all_bottom:
+            split_y = image_center_y
+        else:
+            split_y = sum(cy_values) / len(cy_values)
 
     # Assign quadrant IDs
     new_mask = np.zeros_like(mask)
