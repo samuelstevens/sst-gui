@@ -1,7 +1,7 @@
 """Upload butterfly dataset to HuggingFace Hub as parquet.
 
 Usage:
-    uv run python upload.py --repo-id YOUR_USERNAME/cambridge-butterflies
+    uv run python upload.py v1.2
 """
 
 import pathlib
@@ -15,7 +15,8 @@ from PIL import Image
 
 @beartype.beartype
 def main(
-    repo_id: str,
+    revision: str,
+    repo_id: str = "samuelstevens/cambridge-segfolder",
     dataset_dpath: pathlib.Path = pathlib.Path(
         "/local/scratch/stevens.994/datasets/cambridge-segfolder"
     ),
@@ -24,7 +25,8 @@ def main(
     """Upload dataset to HuggingFace Hub.
 
     Args:
-        repo_id: HuggingFace repo ID (e.g., 'username/dataset-name').
+        revision: Git branch/tag to push to (e.g., 'v1.2').
+        repo_id: HuggingFace repo ID.
         dataset_dpath: Path to the dataset directory.
         split: Split name to upload.
     """
@@ -59,7 +61,7 @@ def main(
 
     # Push to hub
     print(f"Uploading {len(ds)} samples to {repo_id}...")
-    ds.push_to_hub(repo_id, private=True)
+    ds.push_to_hub(repo_id, private=True, revision=revision)
     print(f"Done! Dataset available at https://huggingface.co/datasets/{repo_id}")
 
 
