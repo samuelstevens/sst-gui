@@ -84,15 +84,14 @@ def get_frames(spec: lib.Spec) -> list[FrameMeta]:
 
 
 @beartype.beartype
-def get_ref_masks(spec: lib.Spec, group_pks: set[str]) -> dict[str, np.ndarray]:
-    """Load reference masks for a group. Returns dict of pk -> mask array."""
+def get_ref_masks(spec: lib.Spec) -> dict[str, np.ndarray]:
+    """Load all reference masks. Returns dict of pk -> mask array."""
     ref_masks: dict[str, np.ndarray] = {}
     for mask_fpath in spec.ref_masks.glob("*.png"):
         pk = mask_fpath.stem
-        if pk in group_pks:
-            with Image.open(mask_fpath) as m:
-                mask = np.array(m, dtype=np.uint8)
-            ref_masks[pk] = mask
+        with Image.open(mask_fpath) as m:
+            mask = np.array(m, dtype=np.uint8)
+        ref_masks[pk] = mask
     return ref_masks
 
 
@@ -360,37 +359,39 @@ def run_dry_run(spec: lib.Spec, frame_groups: dict[tuple, list[FrameMeta]]) -> N
     Outputs failed primary keys to stdout (one per line) for piping to check.py.
     """
     logger.info("Running dry-run validation (mask_mode=%s)", spec.mask_mode)
-    failed_pks: list[str] = []
 
-    for group, group_frames in frame_groups.items():
-        group_pks = set(frame.pk for frame in group_frames)
-        ref_masks = get_ref_masks(spec, group_pks)
-        if not ref_masks:
-            logger.warning("Skipping group %s: no reference masks.", group)
+    # Load all refs once
+    ref_masks = get_ref_masks(spec)
+    if not ref_masks:
+        logger.error("No reference masks found.")
+        return
+
+    logger.info("Loaded %d reference masks.", len(ref_masks))
+
+    # Build pk -> frame mapping from all frames
+    all_frames = [f for frames in frame_groups.values() for f in frames]
+    pk_to_frame = {frame.pk: frame for frame in all_frames}
+
+    failed_pks: list[str] = []
+    for pk, mask in ref_masks.items():
+        frame = pk_to_frame.get(pk)
+        if frame is None:
+            logger.warning("Ref %s: no matching frame in dataset", pk)
             continue
 
-        ref_pks = set(ref_masks.keys())
-        ref_frames = [frame for frame in group_frames if frame.pk in ref_pks]
-        pk_to_frame = {frame.pk: frame for frame in ref_frames}
+        obj_ids = lib.get_obj_ids(mask)
+        if not obj_ids:
+            logger.warning("Ref %s: empty mask (no objects)", pk)
+            failed_pks.append(pk)
+            continue
 
-        for pk, mask in ref_masks.items():
-            frame = pk_to_frame.get(pk)
-            if frame is None:
-                continue
-
-            obj_ids = lib.get_obj_ids(mask)
-            if not obj_ids:
-                logger.warning("Group %s ref %s: empty mask (no objects)", group, pk)
-                failed_pks.append(pk)
-                continue
-
-            try:
-                img_width, img_height = frame.original_size
-                lib.transform_mask_for_mode(mask, spec.mask_mode, img_width, img_height)
-                logger.info("Group %s ref %s: %d objects, OK", group, pk, len(obj_ids))
-            except (AssertionError, ValueError) as exc:
-                logger.error("Group %s ref %s: %s", group, pk, exc)
-                failed_pks.append(pk)
+        try:
+            img_width, img_height = frame.original_size
+            lib.transform_mask_for_mode(mask, spec.mask_mode, img_width, img_height)
+            logger.info("Ref %s: %d objects, OK", pk, len(obj_ids))
+        except (AssertionError, ValueError) as exc:
+            logger.error("Ref %s: %s", pk, exc)
+            failed_pks.append(pk)
 
     if failed_pks:
         logger.error("Dry run completed with %d failed masks.", len(failed_pks))
@@ -441,46 +442,46 @@ def main(
 
     spec.pred_masks.mkdir(parents=True, exist_ok=True)
 
-    # Filter to groups with reference masks
-    # group_key (columns) -> (list of frames, reference masks [pk -> mask array])
-    groups_to_process: dict[tuple, tuple[list[FrameMeta], dict[str, np.ndarray]]] = {}
+    # Load and transform all reference masks once (shared across all groups)
+    raw_ref_masks = get_ref_masks(spec)
+    if not raw_ref_masks:
+        logger.error("No reference masks found. Cannot proceed.")
+        return
+
+    logger.info("Loaded %d reference masks.", len(raw_ref_masks))
+
+    # Get ref frames from all groups
+    all_frames = [f for frames in frame_groups.values() for f in frames]
+    raw_ref_pks = set(raw_ref_masks.keys())
+    raw_ref_frames = [f for f in all_frames if f.pk in raw_ref_pks]
+
+    ref_masks = transform_ref_masks(spec.mask_mode, raw_ref_frames, raw_ref_masks)
+    if not ref_masks:
+        logger.error("No usable reference masks after transformation. Cannot proceed.")
+        return
+
+    ref_pks = set(ref_masks.keys())
+    logger.info("Using %d reference masks after transformation.", len(ref_masks))
+
+    # Apply max_frames limit per group if specified
+    groups_to_process: dict[tuple, list[FrameMeta]] = {}
     for group, group_frames in frame_groups.items():
-        group_pks = set(frame.pk for frame in group_frames)
-        raw_ref_masks = get_ref_masks(spec, group_pks)
-        if not raw_ref_masks:
-            logger.warning("Skipping group %s: no reference masks.", group)
-            continue
-
-        raw_ref_pks = set(raw_ref_masks.keys())
-        raw_ref_frames = [frame for frame in group_frames if frame.pk in raw_ref_pks]
-        ref_masks = transform_ref_masks(spec.mask_mode, raw_ref_frames, raw_ref_masks)
-        if not ref_masks:
-            logger.warning("Skipping group %s: no usable reference masks.", group)
-            continue
-
-        ref_pks = set(ref_masks.keys())
-        ref_frames_list = [frame for frame in group_frames if frame.pk in ref_pks]
-
-        # Limit frames per group for debugging (keeping all reference frames)
         if max_frames is not None and len(group_frames) > max_frames:
-            other_frames = [frame for frame in group_frames if frame.pk not in ref_pks]
-            n_other = max(0, max_frames - len(ref_frames_list))
-            group_frames = ref_frames_list + other_frames[:n_other]
+            # Keep ref frames that are in this group, limit others
+            group_ref_frames = [f for f in group_frames if f.pk in ref_pks]
+            other_frames = [f for f in group_frames if f.pk not in ref_pks]
+            n_other = max(0, max_frames - len(group_ref_frames))
+            group_frames = group_ref_frames + other_frames[:n_other]
             logger.info(
                 "Group %s limited to %d frames (%d refs + %d targets)",
                 group,
                 len(group_frames),
-                len(ref_frames_list),
+                len(group_ref_frames),
                 n_other,
             )
+        groups_to_process[group] = group_frames
 
-        groups_to_process[group] = (group_frames, ref_masks)
-
-    if not groups_to_process:
-        logger.error("No groups have reference masks. Cannot proceed.")
-        return
-
-    logger.info("Processing %d groups with reference masks.", len(groups_to_process))
+    logger.info("Processing %d groups.", len(groups_to_process))
 
     # Load model
     logger.info("Loading model: %s", spec.sam2)
@@ -490,17 +491,16 @@ def main(
     processor = transformers.Sam2VideoProcessor.from_pretrained(spec.sam2)
     model.eval()
 
-    # Count total targets
+    # Count total targets (frames that aren't refs)
     total_targets = sum(
-        len(group_frames) - len(ref_masks)
-        for group_frames, ref_masks in groups_to_process.values()
+        len([f for f in group_frames if f.pk not in ref_pks])
+        for group_frames in groups_to_process.values()
     )
     total_processed = 0
     start_time = time.time()
 
-    # Process each group
-    for group, (group_frames, ref_masks) in groups_to_process.items():
-        ref_pks = set(ref_masks.keys())
+    # Process each group (using shared ref_masks)
+    for group, group_frames in groups_to_process.items():
         ref_frames = [f for f in group_frames if f.pk in ref_pks]
         target_frames = [f for f in group_frames if f.pk not in ref_pks]
 
